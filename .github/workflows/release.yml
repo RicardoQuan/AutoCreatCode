@@ -53,8 +53,15 @@ jobs:
 
           $shouldRun = 'true'
           if ($env:EVENT_NAME -eq 'push' -and $env:REF_TYPE -ne 'tag') {
-            & gh release view "v$version" --repo $env:REPOSITORY *> $null
-            if ($LASTEXITCODE -eq 0) {
+            $releaseListJson = & gh release list --repo $env:REPOSITORY --limit 100 --json tagName
+            if ($LASTEXITCODE -ne 0) {
+              throw 'Unable to check existing GitHub Releases.'
+            }
+            $releaseTags = @()
+            if (-not [string]::IsNullOrWhiteSpace($releaseListJson)) {
+              $releaseTags = @($releaseListJson | ConvertFrom-Json | ForEach-Object { $_.tagName })
+            }
+            if ($releaseTags -contains "v$version") {
               $shouldRun = 'false'
               Write-Host "Release v$version already exists; skipping the main-branch bootstrap."
             }
@@ -117,3 +124,4 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "GitHub Release publishing failed with exit code $LASTEXITCODE."
           }
+
