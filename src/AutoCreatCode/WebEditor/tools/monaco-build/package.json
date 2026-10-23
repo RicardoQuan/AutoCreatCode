@@ -1,0 +1,10 @@
+{
+  "name": "equipment-flow-monaco-build",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Builds the offline Monaco Editor runtime bundled by WebEditor.",
+  "devDependencies": {
+    "esbuild": "0.27.7",
+    "monaco-editor": "0.57.0"
+  }
+}

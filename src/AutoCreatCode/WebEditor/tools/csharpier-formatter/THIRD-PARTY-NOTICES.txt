@@ -1,0 +1,5 @@
+CSharpier.Core 1.3.0
+Copyright (c) 2021 belav
+License: MIT (see CSharpier.LICENSE.txt)
+Source: https://github.com/belav/csharpier
+Package: https://www.nuget.org/packages/CSharpier.Core/1.3.0

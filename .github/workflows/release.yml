@@ -1,0 +1,119 @@
+name: Build and publish AutoCreatCode release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version without the v prefix
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: autocreatcode-release
+  cancel-in-progress: false
+
+jobs:
+  decide:
+    runs-on: windows-latest
+    outputs:
+      should_run: ${{ steps.release.outputs.should_run }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Resolve release version
+        id: release
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:EVENT_NAME -eq 'workflow_dispatch') {
+            $version = $env:INPUT_VERSION
+          } elseif ($env:REF_TYPE -eq 'tag') {
+            $version = $env:REF_NAME -replace '^v', ''
+          } else {
+            $version = '1.0'
+          }
+          if ($version -notmatch '^\d+\.\d+(\.\d+)?$') {
+            throw "Release version '$version' must use numeric major.minor[.patch] format."
+          }
+
+          $shouldRun = 'true'
+          if ($env:EVENT_NAME -eq 'push' -and $env:REF_TYPE -ne 'tag') {
+            & gh release view "v$version" --repo $env:REPOSITORY *> $null
+            if ($LASTEXITCODE -eq 0) {
+              $shouldRun = 'false'
+              Write-Host "Release v$version already exists; skipping the main-branch bootstrap."
+            }
+          }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "should_run=$shouldRun" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+  build-and-publish:
+    needs: decide
+    if: needs.decide.outputs.should_run == 'true'
+    runs-on: windows-latest
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@v4
+
+      - name: Install .NET SDK for the self-contained formatter
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Build offline installer and project archive
+        shell: pwsh
+        env:
+          AUTO_VERSION: ${{ needs.decide.outputs.version }}
+        run: |
+          ./installer/Build-Installer.ps1 -Version $env:AUTO_VERSION
+
+      - name: Publish GitHub Release assets
+        shell: pwsh
+        env:
+          AUTO_VERSION: ${{ needs.decide.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = "v$env:AUTO_VERSION"
+          $setupPath = "dist/AutoCreatCode-Setup-v$env:AUTO_VERSION.exe"
+          $sourcePath = "dist/AutoCreatCode-Source-v$env:AUTO_VERSION.zip"
+          if (-not (Test-Path -LiteralPath $setupPath) -or -not (Test-Path -LiteralPath $sourcePath)) {
+            throw 'Expected release assets were not created.'
+          }
+
+          & gh release view $tag --repo $env:REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $tag already exists; it was not overwritten."
+            exit 0
+          }
+
+          $notesPath = Join-Path $env:RUNNER_TEMP 'autocreatcode-release-notes.md'
+          @"
+          ## AutoCreatCode V$env:AUTO_VERSION
+
+          - Windows x64 offline installer: AutoCreatCode-Setup-v$env:AUTO_VERSION.exe
+          - Complete browser-first project archive: AutoCreatCode-Source-v$env:AUTO_VERSION.zip
+          - The WebEditor remains the primary UI and development source; the desktop app opens the same browser editor in a standalone WebView2 window.
+          - The installer includes missing .NET Framework 4.8 and WebView2 Runtime prerequisites and adds desktop and Start menu shortcuts.
+          "@ | Set-Content -LiteralPath $notesPath -Encoding utf8
+
+          & gh release create $tag $setupPath $sourcePath --repo $env:REPOSITORY --title "AutoCreatCode V$env:AUTO_VERSION" --notes-file $notesPath
+          if ($LASTEXITCODE -ne 0) {
+            throw "GitHub Release publishing failed with exit code $LASTEXITCODE."
+          }
