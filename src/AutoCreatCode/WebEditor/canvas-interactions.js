@@ -80,6 +80,44 @@
       e: { x: point.x + size.width, y: point.y + size.height * ratio } })[side] || { x: point.x, y: point.y };
   }
 
+  function sideLaneX(nodes, positions, from, to, side, padding = 72) {
+    const top = Math.min(positions[from.NodeId].y, positions[to.NodeId].y) - 28;
+    const bottom = Math.max(positions[from.NodeId].y + nodeSize(from).height, positions[to.NodeId].y + nodeSize(to).height) + 28;
+    const bounds = nodes.filter(node => positions[node.NodeId]
+      && positions[node.NodeId].y + nodeSize(node).height >= top && positions[node.NodeId].y <= bottom)
+      .map(node => ({ left: positions[node.NodeId].x, right: positions[node.NodeId].x + nodeSize(node).width }));
+    return side === 'left'
+      ? Math.max(GRID_STEP, Math.floor((Math.min(...bounds.map(bound => bound.left)) - padding) / GRID_STEP) * GRID_STEP)
+      : Math.ceil((Math.max(...bounds.map(bound => bound.right)) + padding) / GRID_STEP) * GRID_STEP;
+  }
+
+  function blocksVerticalRoute(nodes, positions, from, to, x, top, bottom) {
+    return nodes.some(node => {
+      if (node === from || node === to || !positions[node.NodeId]) return false;
+      const point = positions[node.NodeId], size = nodeSize(node);
+      return x > point.x && x < point.x + size.width
+        && point.y < bottom && point.y + size.height > top;
+    });
+  }
+
+  function sideBranchLead(nodes, positions, lead, laneX, side, sourcePort) {
+    const left = Math.min(lead.x, laneX), right = Math.max(lead.x, laneX);
+    let y = lead.y;
+    for (let attempt = 0; attempt <= nodes.length; attempt++) {
+      const blockers = nodes.filter(node => {
+        const point = positions[node.NodeId];
+        if (!point) return false;
+        const size = nodeSize(node);
+        return point.x < right && point.x + size.width > left && y > point.y && y < point.y + size.height;
+      });
+      if (!blockers.length) break;
+      const above = sourcePort === 'n' || (sourcePort !== 's' && side === 'left');
+      y = above ? Math.min(...blockers.map(node => positions[node.NodeId].y)) - 28
+        : Math.max(...blockers.map(node => positions[node.NodeId].y + nodeSize(node).height)) + 28;
+    }
+    return { x: lead.x, y };
+  }
+
   function routePoints(edge, nodes, layout) {
     const from = nodes.find(node => node.NodeId === edge.FromNodeId);
     const to = nodes.find(node => node.NodeId === edge.ToNodeId);
@@ -94,15 +132,6 @@
     const b = { x: end.x + tv[0], y: end.y + tv[1] };
     const horizontal = sourcePort === 'e' || sourcePort === 'w';
     const self = from === to;
-    if (self && !(Array.isArray(edge.CanvasWaypoints) && edge.CanvasWaypoints.length)) {
-      const size = nodeSize(from), pos = layout[from.NodeId];
-      if (horizontal) {
-        const y = Number.isFinite(edge.CanvasBendY) ? edge.CanvasBendY : pos.y + size.height + 90;
-        return [start, a, { x: a.x, y }, { x: b.x, y }, b, end];
-      }
-      const x = Number.isFinite(edge.CanvasBendX) ? edge.CanvasBendX : pos.x + size.width + 90;
-      return [start, a, { x, y: a.y }, { x, y: b.y }, b, end];
-    }
     if (Array.isArray(edge.CanvasWaypoints) && edge.CanvasWaypoints.length) {
       const points = [start, a];
       let previous = a;
@@ -124,24 +153,27 @@
         ? [start, a, { x, y: a.y }, { x, y }, { x: b.x, y }, b, end]
         : [start, a, { x: a.x, y }, { x, y }, { x, y: b.y }, b, end];
     }
-    // A downward side branch must travel outside the process column; a midpoint
-    // lane can otherwise pass behind every intervening node and look broken.
-    const sideBranch = horizontal && ['e', 'w'].includes(sourcePort) && targetPort === 'n' && b.y > a.y;
-    if (sideBranch) {
-      const top = Math.min(a.y, b.y), bottom = Math.max(a.y, b.y);
-      const obstacles = nodes.filter(node => {
-        if (node.NodeId === from.NodeId || node.NodeId === to.NodeId || !layout[node.NodeId]) return false;
-        const position = layout[node.NodeId], size = nodeSize(node);
-        return position.y + size.height >= top && position.y <= bottom;
-      });
-      const relevant = [from, to, ...obstacles].map(node => {
-        const position = layout[node.NodeId], size = nodeSize(node);
-        return { left: position.x, right: position.x + size.width };
-      });
-      const laneX = sourcePort === 'e'
-        ? Math.max(...relevant.map(bounds => bounds.right)) + 28
-        : Math.max(GRID_STEP, Math.min(...relevant.map(bounds => bounds.left)) - 28);
-      return [start, a, { x: laneX, y: a.y }, { x: laneX, y: b.y }, b, end];
+    if (self && horizontal && Number.isFinite(edge.CanvasBendY)) {
+      return [start, a, { x: a.x, y: edge.CanvasBendY }, { x: b.x, y: edge.CanvasBendY }, b, end];
+    }
+    const returning = self || layout[to.NodeId].y < layout[from.NodeId].y;
+    const sideBranch = horizontal && targetPort === 'n' && b.y > a.y;
+    const blocked = targetPort === 'n' && b.y > a.y
+      && blocksVerticalRoute(nodes, layout, from, to, a.x, a.y, b.y);
+    // Explicit waypoints above remain authoritative. Automatic return routes
+    // go left; forward side branches and jumps bypass the process column right.
+    if (returning || sideBranch || blocked || Number.isFinite(edge.CanvasBendX)) {
+      const side = Number.isFinite(edge.CanvasBendX)
+        ? edge.CanvasBendX < layout[from.NodeId].x ? 'left' : 'right' : returning ? 'left' : 'right';
+      const laneX = Number.isFinite(edge.CanvasBendX) ? edge.CanvasBendX : sideLaneX(nodes, layout, from, to, side);
+      const points = [start, a];
+      const branch = sideBranchLead(nodes, layout, a, laneX, side, sourcePort);
+      appendOrthogonal(points, a, branch, 'v');
+      appendOrthogonal(points, branch, { x: laneX, y: branch.y }, 'h');
+      appendOrthogonal(points, points[points.length - 1], { x: laneX, y: b.y }, 'v');
+      appendOrthogonal(points, points[points.length - 1], b, 'h');
+      appendOrthogonal(points, points[points.length - 1], end, 'v');
+      return points;
     }
     const mid = horizontal
       ? (Number.isFinite(edge.CanvasBendX) ? edge.CanvasBendX : (a.x + b.x) / 2)
@@ -159,7 +191,9 @@
     const groups = new Map();
     transitions.forEach((edge, index) => {
       if (edge.FromNodeId === edge.ToNodeId) return;
-      const key = JSON.stringify([String(edge.ToNodeId), edge.CanvasTargetPort || 'n']);
+      const sourcePosition = positions[edge.FromNodeId], targetPosition = positions[edge.ToNodeId];
+      const direction = sourcePosition && targetPosition && sourcePosition.y > targetPosition.y ? 'return' : 'forward';
+      const key = JSON.stringify([String(edge.ToNodeId), edge.CanvasTargetPort || 'n', direction]);
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(index);
     });
@@ -176,18 +210,16 @@
       // without forcing this main connection to loop out and back.
       const direct = group.filter(item => {
         const source = nodes.find(node => node.NodeId === item.edge.FromNodeId), position = positions[item.edge.FromNodeId];
-        if (!source || !position || (item.edge.CanvasSourcePort || 's') !== 's'
+        if (!source || !position || targetPort !== 'n' || (item.edge.CanvasSourcePort || 's') !== 's'
           || (item.edge.CanvasTargetPort || 'n') !== targetPort
+          || Number.isFinite(item.edge.CanvasBendX)
           || (item.edge.CanvasSourceRatio != null && Math.abs(Number(item.edge.CanvasSourceRatio) - .5) > .01)
           || (item.edge.CanvasTargetRatio != null && Math.abs(Number(item.edge.CanvasTargetRatio) - .5) > .01)) return false;
         const size = nodeSize(source), sourceCenterX = position.x + size.width / 2;
-        const approachesTargetVertically = targetPort === 'n'
-          ? position.y + size.height <= targetPosition.y
-          : targetPort === 's' && position.y >= targetPosition.y + targetSize.height;
-        return Math.abs(sourceCenterX - targetCenterX) < 1 && approachesTargetVertically;
+        return Math.abs(sourceCenterX - targetCenterX) < 1 && position.y + size.height <= targetPosition.y
+          && !blocksVerticalRoute(nodes, positions, source, target, sourceCenterX, position.y + size.height, targetPosition.y);
       }).sort((left, right) => {
         const leftNode = nodes.find(node => node.NodeId === left.edge.FromNodeId), rightNode = nodes.find(node => node.NodeId === right.edge.FromNodeId);
-        if (targetPort === 's') return positions[leftNode.NodeId].y - positions[rightNode.NodeId].y;
         return positions[rightNode.NodeId].y + nodeSize(rightNode).height
           - positions[leftNode.NodeId].y - nodeSize(leftNode).height;
       })[0] || null;
@@ -210,8 +242,9 @@
       // Keep the shared side lane outside the nodes. When a direct aligned
       // main route exists, side branches join its open final segment instead
       // of sending every incoming wire around the target and back.
-      const allFromWest = sourcePorts.every(port => port === 'w');
-      const laneSide = allFromWest ? 'left' : 'right';
+      const returning = group.every(item => positions[item.edge.FromNodeId]
+        && positions[item.edge.FromNodeId].y > targetPosition.y);
+      const laneSide = returning ? 'left' : 'right';
       const targetRatio = .5;
       const targetAnchor = anchor(target, targetPosition, targetPort, targetRatio);
       const targetNormal = ({ n: [0, -28], s: [0, 28], w: [-28, 0], e: [28, 0] })[targetPort];
@@ -222,14 +255,7 @@
         const port = edge.CanvasSourcePort || 's', start = anchor(node, position, port, edge.CanvasSourceRatio);
         const normal = ({ n: [0, -28], s: [0, 28], w: [-28, 0], e: [28, 0] })[port];
         const lead = { x: start.x + normal[0], y: start.y + normal[1] };
-        const prefix = [start, lead];
-        let join = lead;
-        if (port === 'w' && laneSide === 'right') {
-          const above = { x: join.x, y: position.y - 28 };
-          appendOrthogonal(prefix, join, above, 'v');
-          join = prefix[prefix.length - 1];
-        }
-        return { node, position, start, lead, prefix, join };
+        return { node, position, port, start, lead, prefix: [start, lead], join: lead };
       });
       if (sources.some(source => !source)) return;
       const top = Math.min(targetLead.y, ...sources.map(source => source.join.y));
@@ -263,6 +289,10 @@
         const branchWaypoints = Array.isArray(edge.CanvasMergeWaypoints) ? edge.CanvasMergeWaypoints
           : Array.isArray(edge.CanvasWaypoints) ? edge.CanvasWaypoints : [];
         let branchPoint = source.join;
+        if (!branchWaypoints.length && !Number.isFinite(edge.CanvasMergeBranchY)) {
+          branchPoint = sideBranchLead(nodes, positions, source.lead, lane, laneSide, source.port);
+          appendOrthogonal(points, source.lead, branchPoint, 'v');
+        }
         branchWaypoints.forEach(waypoint => {
           const point = { x: Number(waypoint.x), y: Number(waypoint.y) };
           if (!Number.isFinite(point.x) || !Number.isFinite(point.y)) return;
@@ -271,7 +301,7 @@
         });
         const branchY = branchWaypoints.length
           ? branchPoint.y
-          : Number.isFinite(edge.CanvasMergeBranchY) ? edge.CanvasMergeBranchY : source.join.y;
+          : Number.isFinite(edge.CanvasMergeBranchY) ? edge.CanvasMergeBranchY : branchPoint.y;
         appendOrthogonal(points, branchPoint, { x: lane, y: branchY }, Math.abs(branchPoint.y - branchY) < .01 ? 'h' : 'v');
         if (directJoin) {
           appendOrthogonal(points, points[points.length - 1], { x: lane, y: directJoin.y }, 'v');
@@ -377,6 +407,81 @@
       });
     }
     return ranks;
+  }
+
+  function arrangeDownward(graph, positions, methodFor = () => null) {
+    if (!graph || !graph.Nodes.length) return;
+    const nodes = graph.Nodes, transitions = graph.Transitions;
+    const nodeById = new Map(nodes.map(node => [node.NodeId, node]));
+    const root = nodes.find(node => node.NodeType === 'Start')
+      || nodeById.get(graph.EntryNodeId) || nodes[0];
+    const ranks = downwardRanks(nodes, transitions, root.NodeId);
+    const outgoing = id => transitions.filter(edge => edge.FromNodeId === id && nodeById.has(edge.ToNodeId)
+      && ranks.get(edge.ToNodeId) > ranks.get(id))
+      .sort((a, b) => Number(a.Priority || 0) - Number(b.Priority || 0));
+    const primaryEdge = (node, edges) => {
+      if (!edges.length) return null;
+      const alarmCodes = new Set((methodFor(node)?.AlarmStatusCodes || []).map(code => String(code).toLowerCase()));
+      const ordinary = edge => nodeById.get(edge.ToNodeId).NodeType !== 'Alarm'
+        && !alarmCodes.has(String(edge.Outcome).toLowerCase());
+      for (const outcome of ['0', 'true', 'succeeded', 'success']) {
+        const preferred = edges.find(edge => String(edge.Outcome).toLowerCase() === outcome && ordinary(edge));
+        if (preferred) return preferred;
+      }
+      return edges.find(edge => ordinary(edge) && !['false', 'failed', 'failure'].includes(String(edge.Outcome).toLowerCase()))
+        || edges.find(ordinary) || edges[0];
+    };
+    const continuations = new Map(nodes.map(node => [node.NodeId, primaryEdge(node, outgoing(node.NodeId))]));
+    const primary = new Set();
+    let id = root.NodeId;
+    while (id && !primary.has(id)) {
+      primary.add(id);
+      id = continuations.get(id)?.ToNodeId;
+    }
+    const maxNodeWidth = Math.max(224, ...nodes.map(node => nodeSize(node).width));
+    const columnWidth = maxNodeWidth + 130;
+    const lanes = new Map([...primary].map(nodeId => [nodeId, 0]));
+    let nextLane = 1;
+    const orderedByRank = [...nodes].sort((left, right) => ranks.get(left.NodeId) - ranks.get(right.NodeId)
+      || nodes.indexOf(left) - nodes.indexOf(right));
+    orderedByRank.forEach(node => {
+      if (!lanes.has(node.NodeId)) lanes.set(node.NodeId, nextLane++);
+      const lane = lanes.get(node.NodeId), continuation = continuations.get(node.NodeId);
+      outgoing(node.NodeId).forEach(edge => {
+        if (!lanes.has(edge.ToNodeId)) lanes.set(edge.ToNodeId, edge === continuation ? lane : nextLane++);
+      });
+    });
+    const rowHeights = new Map(), rowY = new Map();
+    nodes.forEach(node => rowHeights.set(ranks.get(node.NodeId), Math.max(rowHeights.get(ranks.get(node.NodeId)) || 0, nodeSize(node).height)));
+    let y = 60;
+    [...rowHeights.keys()].sort((a, b) => a - b).forEach(rank => { rowY.set(rank, y); y += rowHeights.get(rank) + 100; });
+    const mainCenterX = 180 + maxNodeWidth / 2;
+    nodes.forEach(node => {
+      positions[node.NodeId] = {
+        x: Math.round(mainCenterX + (lanes.get(node.NodeId) || 0) * columnWidth - nodeSize(node).width / 2),
+        y: rowY.get(ranks.get(node.NodeId)),
+      };
+    });
+    const geometry = ['CanvasBendX', 'CanvasBendY', 'CanvasRouteOrientation', 'CanvasMergeLaneX', 'CanvasMergeJoinY',
+      'CanvasMergeBranchY', 'CanvasWaypoints', 'CanvasMergeWaypoints', 'CanvasMergeLaneAnchors'];
+    transitions.forEach(edge => {
+      geometry.forEach(key => { delete edge[key]; });
+      const source = nodeById.get(edge.FromNodeId), target = nodeById.get(edge.ToNodeId);
+      if (!source || !target) return;
+      const from = positions[source.NodeId], to = positions[target.NodeId];
+      const self = source === target, returning = self || to.y < from.y;
+      const sourceCenter = from.x + nodeSize(source).width / 2, targetCenter = to.x + nodeSize(target).width / 2;
+      const main = !returning && continuations.get(source.NodeId) === edge && Math.abs(sourceCenter - targetCenter) < 1
+        && !blocksVerticalRoute(nodes, positions, source, target, sourceCenter, from.y + nodeSize(source).height, to.y);
+      // Outcome/Priority describe execution; ports and bends only describe layout.
+      const centeredZero = String(edge.Outcome) === '0' && source.NodeType !== 'Condition';
+      edge.CanvasSourcePort = main || centeredZero ? 's' : returning ? 'w' : 'e';
+      edge.CanvasSourceRatio = .5;
+      edge.CanvasTargetPort = returning && !self ? 's' : 'n';
+      edge.CanvasTargetRatio = .5;
+      if (!main) edge.CanvasBendX = sideLaneX(nodes, positions, source, target, returning ? 'left' : 'right',
+        Math.max(72, String(edge.Outcome || '*').length * 10 + 48));
+    });
   }
 
   function create(adapter) {
@@ -498,84 +603,7 @@
     function arrange() {
       const f = flow(); if (!f || !f.Nodes.length) return;
       recordBefore();
-      const nodeById = new Map(f.Nodes.map(node => [node.NodeId, node]));
-      const outgoing = id => f.Transitions.filter(edge => edge.FromNodeId === id)
-        .sort((a, b) => Number(a.Priority || 0) - Number(b.Priority || 0));
-      const primaryEdge = (node, edges) => {
-        if (!edges.length) return null;
-        const method = adapter.methodFor(node);
-        const alarmCodes = new Set((method && method.AlarmStatusCodes || []).map(code => String(code).toLowerCase()));
-        const ordinaryTarget = edge => (nodeById.get(edge.ToNodeId) || {}).NodeType !== 'Alarm';
-        const preferred = edges.find(edge => ['true', 'succeeded', 'success'].includes(String(edge.Outcome).toLowerCase())
-          && !alarmCodes.has(String(edge.Outcome).toLowerCase()) && ordinaryTarget(edge));
-        if (preferred) return preferred;
-        const normal = edges.find(edge => !alarmCodes.has(String(edge.Outcome).toLowerCase())
-          && !['false', 'failed', 'failure'].includes(String(edge.Outcome).toLowerCase()) && ordinaryTarget(edge));
-        return normal || edges.find(ordinaryTarget) || edges[0];
-      };
-      // The canvas entry metadata can be stale in older projects. Layout always
-      // starts at the actual Start shape so it shares the main flow's centerline.
-      const root = f.Nodes.find(node => node.NodeType === 'Start')
-        || f.Nodes.find(node => node.NodeId === f.EntryNodeId) || f.Nodes[0];
-      const rootId = root.NodeId;
-      const ranks = downwardRanks(f.Nodes, f.Transitions, rootId), primary = new Set();
-      let id = rootId;
-      while (id && !primary.has(id)) {
-        primary.add(id);
-        const next = primaryEdge(nodeById.get(id), outgoing(id));
-        id = next && next.ToNodeId;
-      }
-      const maxNodeWidth = Math.max(224, ...f.Nodes.map(node => nodeSize(node).width));
-      const columnWidth = maxNodeWidth + 130;
-      const lanes = new Map([...primary].map(nodeId => [nodeId, 0]));
-      let nextLane = 1;
-      const orderedByRank = [...f.Nodes].sort((left, right) => {
-        const rankDelta = ranks.get(left.NodeId) - ranks.get(right.NodeId);
-        return rankDelta || f.Nodes.indexOf(left) - f.Nodes.indexOf(right);
-      });
-      orderedByRank.forEach(node => {
-        const rank = ranks.get(node.NodeId);
-        if (!lanes.has(node.NodeId)) lanes.set(node.NodeId, nextLane++);
-        const lane = lanes.get(node.NodeId);
-        const edges = outgoing(node.NodeId).filter(edge => nodeById.has(edge.ToNodeId)
-          && ranks.get(edge.ToNodeId) > rank);
-        const continuation = primaryEdge(node, edges);
-        edges.forEach(edge => {
-          if (lanes.has(edge.ToNodeId)) return;
-          lanes.set(edge.ToNodeId, edge === continuation ? lane : nextLane++);
-        });
-      });
-      const rowHeights = new Map(), rowY = new Map();
-      f.Nodes.forEach(node => rowHeights.set(ranks.get(node.NodeId), Math.max(rowHeights.get(ranks.get(node.NodeId)) || 0, nodeSize(node).height)));
-      let y = 60;
-      [...rowHeights.keys()].sort((a, b) => a - b).forEach(rank => { rowY.set(rank, y); y += rowHeights.get(rank) + 100; });
-      const mainCenterX = 180 + maxNodeWidth / 2;
-      f.Nodes.forEach(node => {
-        const rank = ranks.get(node.NodeId), lane = lanes.get(node.NodeId) || 0;
-        layout()[node.NodeId] = {
-          x: Math.round(mainCenterX + lane * columnWidth - nodeSize(node).width / 2),
-          y: rowY.get(rank),
-        };
-      });
-      // Recalculate vertical entry ports after arranging nodes. A feedback
-      // edge must enter the earlier node from below so its arrow points up.
-      // Preserve intentional horizontal entries selected by the user.
-      f.Transitions.forEach(edge => {
-        const source = nodeById.get(edge.FromNodeId), target = nodeById.get(edge.ToNodeId);
-        const sourcePosition = layout()[edge.FromNodeId], targetPosition = layout()[edge.ToNodeId];
-        const currentTargetPort = edge.CanvasTargetPort || 'n';
-        if (!source || !target || !sourcePosition || !targetPosition || !['n', 's'].includes(currentTargetPort)) return;
-        const sourceSize = nodeSize(source), targetSize = nodeSize(target);
-        if (targetPosition.y >= sourcePosition.y + sourceSize.height) edge.CanvasTargetPort = 'n';
-        else if (sourcePosition.y >= targetPosition.y + targetSize.height) edge.CanvasTargetPort = 's';
-      });
-      // Manual waypoints are absolute canvas coordinates. Once nodes move,
-      // keeping those old coordinates stretches routes across the new layout.
-      // Keep the transition graph and rebuild only the wire geometry from the
-      // newly arranged node positions.
-      const routeGeometry = ['CanvasBendX', 'CanvasBendY', 'CanvasRouteOrientation', 'CanvasMergeLaneX', 'CanvasMergeJoinY',
-        'CanvasMergeBranchY', 'CanvasWaypoints', 'CanvasMergeWaypoints', 'CanvasMergeLaneAnchors'];
-      f.Transitions.forEach(edge => routeGeometry.forEach(key => { delete edge[key]; }));
+      arrangeDownward(f, layout(), node => adapter.methodFor(node));
       // Persist and redraw from the coordinates just calculated without reloading
       // the layout in the middle of this arrange pass.
       adapter.persist();
@@ -789,12 +817,21 @@
           const horizontal = self ? !['e', 'w'].includes(edge.CanvasSourcePort || 's') : ['e', 'w'].includes(edge.CanvasSourcePort || 's');
           const manual = !self && Number.isFinite(edge.CanvasBendX) && Number.isFinite(edge.CanvasBendY);
           const hasWaypoints = Array.isArray(edge.CanvasWaypoints) && edge.CanvasWaypoints.length > 0;
-          const bend = manual ? { x: edge.CanvasBendX, y: edge.CanvasBendY }
+          const targetNode = f.Nodes.find(node => node.NodeId === edge.ToNodeId);
+          const left = Math.min(layout()[sourceNode.NodeId].x, layout()[targetNode.NodeId].x);
+          const right = Math.max(layout()[sourceNode.NodeId].x + nodeSize(sourceNode).width, layout()[targetNode.NodeId].x + nodeSize(targetNode).width);
+          const sideSegment = !Number.isFinite(edge.CanvasBendY) && !hasWaypoints ? points.slice(1).map((to, i) => ({ from: points[i], to }))
+            .filter(segment => Math.abs(segment.from.x - segment.to.x) < .1
+              && Math.abs(segment.to.y - segment.from.y) > 1
+              && (segment.from.x < left || segment.from.x > right))
+            .sort((a, b) => Math.abs(b.to.y - b.from.y) - Math.abs(a.to.y - a.from.y))[0] : null;
+          const bend = sideSegment ? { x: sideSegment.from.x, y: (sideSegment.from.y + sideSegment.to.y) / 2 }
+            : manual ? { x: edge.CanvasBendX, y: edge.CanvasBendY }
             : points.length > 3 && horizontal ? { x: points[2].x, y: (points[2].y + points[3].y) / 2 }
               : points.length > 3 ? { x: (points[2].x + points[3].x) / 2, y: points[2].y }
                 : midpoint(points);
           if (!hasWaypoints && !route.mergeKey && (manual || self || points.length > 4))
-            svg('rect', { x: bend.x - 5, y: bend.y - 5, width: 10, height: 10, class: 'edge-bend-handle', 'data-axis': self ? horizontal ? 'x' : 'y' : 'both' }, group);
+            svg('rect', { x: bend.x - 5, y: bend.y - 5, width: 10, height: 10, class: 'edge-bend-handle', 'data-axis': sideSegment ? 'x' : self ? horizontal ? 'x' : 'y' : 'both' }, group);
           (edge.CanvasWaypoints || []).forEach((waypoint, waypointIndex) => svg('rect', {
             x: waypoint.x - 5, y: waypoint.y - 5, width: 10, height: 10,
             class: 'edge-bend-handle edge-waypoint-handle', 'data-waypoint-index': waypointIndex,
@@ -1103,17 +1140,19 @@
           <div class="node-surface"></div><div class="node-content"><span class="node-type-mark">${glyph}</span><strong class="node-title">${esc(node.DisplayName || node.NodeId)}</strong><span class="node-method" title="${esc(node.MethodId)}">${esc(method ? method.ReturnType || 'int' : control ? node.NodeId : '未绑定方法')}</span></div>
           ${['n', 'e', 's', 'w'].map(side => `<button class="node-port port-${side}" data-port="${side}" title="拖动连线" aria-label="${esc(node.NodeId)} ${side} 连接点"></button>`).join('')}
           ${outcomes.length ? `<div class="node-outcomes">${outcomes.map((code, i) => {
-            const sideRoute = node.NodeType !== 'Condition' && routes.find(route => route.edge.FromNodeId === node.NodeId
-              && String(route.edge.Outcome) === String(code) && ['e', 'w'].includes(route.edge.CanvasSourcePort || 's'));
+            const connectedRoute = routes.find(route => route.edge.FromNodeId === node.NodeId && String(route.edge.Outcome) === String(code));
+            const sideRoute = connectedRoute && ['e', 'w'].includes(connectedRoute.edge.CanvasSourcePort || 's') ? connectedRoute : null;
             const ratio = outcomeRatio(method, node, outcomes, code);
             const labelPoint = sideRoute && (sideRoute.labelPoint || midpoint(sideRoute.points));
-            const position = node.NodeType === 'Condition' ? '' : sideRoute
+            const sourcePort = connectedRoute ? connectedRoute.edge.CanvasSourcePort || 's' : node.NodeType === 'Condition' && i > 0 ? 'e' : 's';
+            const sourceRatio = connectedRoute ? connectedRoute.edge.CanvasSourceRatio == null ? .5 : Number(connectedRoute.edge.CanvasSourceRatio)
+              : node.NodeType === 'Condition' ? .5 : ratio;
+            const conditionAnchor = node.NodeType === 'Condition' && connectedRoute ? anchor(node, p, sourcePort, sourceRatio) : null;
+            const badgeOffset = ({ n: [0, -16], s: [0, 16], w: [-24, 0], e: [24, 0] })[sourcePort] || [0, 16];
+            const position = node.NodeType === 'Condition' ? conditionAnchor
+              ? ` style="left:${conditionAnchor.x - p.x + badgeOffset[0]}px;top:${conditionAnchor.y - p.y + badgeOffset[1]}px;transform:translate(-50%,-50%)"` : '' : sideRoute
               ? ` style="left:${labelPoint.x - p.x}px;top:${labelPoint.y - p.y - size.height - 5}px;transform:translate(-50%,-50%)"`
               : ` style="left:${ratio * 100}%;transform:translateX(-50%)"`;
-            const sourcePort = sideRoute ? sideRoute.edge.CanvasSourcePort || 's' : node.NodeType === 'Condition' && i > 0 ? 'e' : 's';
-            const sourceRatio = sideRoute
-              ? sideRoute.edge.CanvasSourceRatio == null ? .5 : Number(sideRoute.edge.CanvasSourceRatio)
-              : node.NodeType === 'Condition' ? .5 : ratio;
             return `<button class="outcome-port${node.NodeType === 'Condition' ? i === 0 ? ' condition-true' : ' condition-false' : ''}${(method && method.AlarmStatusCodes || []).map(String).includes(code) || code === 'false' ? ' alternate' : ''}" data-port="${sourcePort}" data-outcome="${esc(code)}" data-ratio="${sourceRatio}"${position} title="拖动连接 ${esc(code)} 分支">${esc(code)}</button>`;
           }).join('')}</div>` : ''}
           <span class="node-resize-handle" title="拖动调整大小"></span></div>`;
@@ -1611,7 +1650,7 @@
       selectedEdge: () => ui.edge == null || !flow() ? null : { edge: flow().Transitions[ui.edge], index: ui.edge },
       clearEdgeSelection: () => { ui.edge = null; }, selectedIds: () => new Set(ui.selected) };
   }
-  const api = { create, nodeSize, routePoints, transitionRoutes, anchor, outcomesFor, downwardRanks };
+  const api = { create, nodeSize, routePoints, transitionRoutes, anchor, outcomesFor, downwardRanks, arrangeDownward };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   host.EquipmentFlowCanvas = api;
 })();

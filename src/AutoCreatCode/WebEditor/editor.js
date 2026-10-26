@@ -317,8 +317,8 @@
     result.HardwareSlots = Array.isArray(result.HardwareSlots) ? result.HardwareSlots : [];
     result.HardwareBindings = Array.isArray(result.HardwareBindings) ? result.HardwareBindings : [];
     result.HardwareDefinitions = Array.isArray(result.HardwareDefinitions) ? result.HardwareDefinitions : [];
-    // Older source-end reconnects could move a bool branch to another port
-    // while retaining its previous Outcome. Restore the canonical mapping.
+    // Port placement is geometry, not the state value. Preserve explicit bool
+    // outcomes when arranging or reopening; infer only missing legacy values.
     result.Flows.forEach(flow => {
       if (!flow || !Array.isArray(flow.Nodes)) return;
       if (!Array.isArray(flow.Transitions)) flow.Transitions = [];
@@ -334,10 +334,12 @@
         if (!edge || typeof edge !== 'object') return;
         const source = nodesById.get(edge.FromNodeId);
         const sourcePort = edge.CanvasSourcePort;
-        if (!source || source.NodeType !== 'Condition' || !source.MethodId || !['e', 's'].includes(sourcePort)) return;
+        if (!source || source.NodeType !== 'Condition' || !source.MethodId) return;
         const method = methodLibrary.resolveMethodSelection(methods, source.MethodId);
         if (!method || !['bool', 'system.boolean'].includes(String(method.ReturnType || '').toLowerCase())) return;
-        edge.Outcome = sourcePort === 'e' ? 'false' : 'true';
+        const outcome = String(edge.Outcome ?? '').toLowerCase();
+        if (['true', 'false'].includes(outcome)) edge.Outcome = outcome;
+        else if (['e', 's'].includes(sourcePort)) edge.Outcome = sourcePort === 'e' ? 'false' : 'true';
       });
     });
     result.CanvasLayouts = result.CanvasLayouts && typeof result.CanvasLayouts === 'object' ? result.CanvasLayouts : {};
