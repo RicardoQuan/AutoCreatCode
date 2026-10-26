@@ -785,7 +785,113 @@
     };
   }
 
-  const api = { parseSource, tokenize };
+  function statusCodeList(values) {
+    if (!Array.isArray(values)) throw new Error('方法返回状态码必须是整数数组。');
+    const codes = values.map(value => {
+      const code = Number(value);
+      if (!Number.isSafeInteger(code)) throw new Error('方法返回状态码必须是整数。');
+      return code;
+    });
+    return [...new Set([0, ...codes])].sort((left, right) => left - right);
+  }
+
+  function rewriteStatusAttributes(attributeSource, codes) {
+    const tokens = tokenize(attributeSource);
+    const { pairs } = createPairs(tokens);
+    const replacements = [];
+    const literal = codes.join(', ');
+    let hasStandaloneCodes = false;
+    let combinedStatusAttribute = null;
+
+    for (let listStart = 0; listStart < tokens.length; listStart += 1) {
+      if (tokens[listStart].value !== '[' || !pairs.has(listStart)) continue;
+      const listEnd = pairs.get(listStart);
+      const attributes = splitTopLevel(tokens.slice(listStart + 1, listEnd), ',');
+      for (const group of attributes) {
+        const openIndex = group.findIndex(token => token.value === '(');
+        if (openIndex < 0) continue;
+        const name = attributeName(group.slice(0, openIndex));
+        const open = group[openIndex];
+        const closeIndex = pairs.get(open.index);
+        if (closeIndex == null) continue;
+        const close = tokens[closeIndex];
+        if (name === 'FlowStatusCodes') {
+          hasStandaloneCodes = true;
+          replacements.push({ start: open.end, end: close.start, text: literal });
+        } else if (name === 'FlowMethod') {
+          const argumentsTokens = tokens.slice(open.index + 1, closeIndex);
+          const argumentsList = splitTopLevel(argumentsTokens, ',');
+          const statusArguments = argumentsList.flatMap(argument => {
+            const equals = argument.findIndex(token => token.value === '=');
+            return equals > 0 && ['StatusCodes', 'ResultStatusCodes'].includes(argument[0].value)
+              ? [{ argument, equals, name: argument[0].value }] : [];
+          });
+          if (statusArguments.length) {
+            statusArguments.forEach(({ argument, equals }) => {
+              const value = argument.slice(equals + 1);
+              if (!value.length) throw new Error('FlowMethod 状态码属性缺少值。');
+              replacements.push({ start: value[0].start, end: value[value.length - 1].end,
+                text: `new int[] { ${literal} }` });
+            });
+          } else if (!combinedStatusAttribute) {
+            combinedStatusAttribute = { end: close.start, hasArguments: argumentsList.length > 0 };
+          }
+        }
+      }
+      listStart = listEnd;
+    }
+
+    if (!hasStandaloneCodes && !replacements.length) {
+      if (combinedStatusAttribute) {
+        replacements.push({ start: combinedStatusAttribute.end, end: combinedStatusAttribute.end,
+          text: `${combinedStatusAttribute.hasArguments ? ', ' : ''}StatusCodes = new int[] { ${literal} }` });
+      } else {
+        return `[FlowStatusCodes(${literal})]${attributeSource ? `\n${attributeSource}` : ''}`;
+      }
+    }
+
+    return replacements.sort((left, right) => right.start - left.start)
+      .reduce((updated, replacement) => updated.slice(0, replacement.start) + replacement.text + updated.slice(replacement.end), attributeSource);
+  }
+
+  function updateResultStatusCodes(source, methodName, values) {
+    if (typeof source !== 'string') throw new Error('C# 源码必须是文本。');
+    const codes = statusCodeList(values);
+    const prefix = 'public partial class __StatusEditor {\n';
+    const suffix = '\n}';
+    let workingSource = source;
+    let wrapped = false;
+    let methods = parseSource(workingSource, '__StatusEditor.cs').classes.flatMap(type => type.methods || []);
+    if (!methods.length) {
+      wrapped = true;
+      workingSource = prefix + source + suffix;
+      methods = parseSource(workingSource, '__StatusEditor.cs').classes.flatMap(type => type.methods || []);
+    }
+
+    const matching = methods.filter(method => method.MethodName === methodName);
+    if (!matching.length) throw new Error(`未找到方法 ${methodName}。`);
+    if (matching.length !== 1) throw new Error(`方法 ${methodName} 不唯一。`);
+
+    const method = matching[0];
+    const previousBlock = workingSource.slice(method.SourceStart, method.SourceEnd);
+    const attributeSource = method.AttributeSource || '';
+    const nextAttributeSource = rewriteStatusAttributes(attributeSource, codes);
+    const nextBlock = attributeSource
+      ? nextAttributeSource + previousBlock.slice(attributeSource.length)
+      : nextAttributeSource + '\n' + previousBlock;
+    workingSource = workingSource.slice(0, method.SourceStart) + nextBlock + workingSource.slice(method.SourceEnd);
+
+    const result = wrapped ? workingSource.slice(prefix.length, workingSource.length - suffix.length) : workingSource;
+    const verificationSource = wrapped ? prefix + result + suffix : result;
+    const verified = parseSource(verificationSource, '__StatusEditor.cs').classes
+      .flatMap(type => type.methods || []).filter(item => item.MethodName === methodName);
+    if (verified.length !== 1 || JSON.stringify(verified[0].ResultStatusCodes) !== JSON.stringify(codes))
+      throw new Error('无法同步方法返回状态码元数据。');
+    return result;
+  }
+
+  const api = { parseSource, tokenize, updateResultStatusCodes };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   if (typeof window !== 'undefined') window.EquipmentFlowCSharpCatalog = api;
 })();
+

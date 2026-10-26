@@ -2385,6 +2385,58 @@
 
   function redrawEdgesOnly() { canvasEditor.renderEdges(); }
 
+  function renderStatusCodeEditor(root, values, onChange) {
+    if (!root) return;
+    const statuses = window.EquipmentFlowMethodStatuses.normalizeResultStatusCodes(values);
+    const render = current => {
+      root.innerHTML = `<div class="status-code-list">${current.map(code => `<span class="status-code-chip${code === 0 ? ' status-code-required' : ''}">${esc(code)}${code === 0
+        ? '<small title="数值状态码必须包含 0">必需</small>'
+        : `<button class="status-code-remove" type="button" data-remove-status="${esc(code)}" aria-label="删除状态码 ${esc(code)}" title="删除状态码">×</button>`}</span>`).join('')}</div>
+        <div class="status-code-add"><input type="number" step="1" data-new-status inputmode="numeric" aria-label="新增状态码" placeholder="新增整数状态码"><button type="button" data-add-status>＋ 添加</button></div>`;
+      root.querySelectorAll('[data-remove-status]').forEach(button => button.addEventListener('click', () => {
+        try {
+          const next = window.EquipmentFlowMethodStatuses.removeResultStatusCode(current, button.dataset.removeStatus);
+          const accepted = onChange ? onChange(next) : next;
+          render(window.EquipmentFlowMethodStatuses.normalizeResultStatusCodes(accepted || next));
+        } catch (error) { setStatus(error.message, 'error'); }
+      }));
+      const input = root.querySelector('[data-new-status]');
+      const add = () => {
+        try {
+          const token = input.value.trim();
+          if (!token) { setStatus('请输入整数状态码。', 'warning'); input.focus(); return; }
+          const next = window.EquipmentFlowMethodStatuses.addResultStatusCode(current, token);
+          if (next.length === current.length) { setStatus(`状态码 ${token} 已存在。`, 'warning'); input.select(); return; }
+          const accepted = onChange ? onChange(next) : next;
+          if (root.isConnected) render(window.EquipmentFlowMethodStatuses.normalizeResultStatusCodes(accepted || next));
+        } catch (error) { setStatus(error.message, 'error'); }
+      };
+      root.querySelector('[data-add-status]').addEventListener('click', add);
+      input.addEventListener('keydown', event => {
+        if (event.key === 'Enter') { event.preventDefault(); add(); }
+      });
+    };
+    render(statuses);
+  }
+
+  function applyMethodResultStatusCodes(method, values) {
+    const statuses = window.EquipmentFlowMethodStatuses.validateResultStatusCodesChange(method, values, state.workspace);
+    const source = String(method.SourceCode || window.EquipmentFlowTaskCodegen.methodSource(method));
+    const sourceWithStatuses = window.EquipmentFlowCSharpCatalog.updateResultStatusCodes(source, method.MethodName, statuses);
+    const parsed = parseMethodCodeEditor(sourceWithStatuses);
+    Object.assign(method, {
+      ResultStatusCodes: statuses,
+      Outcomes: statuses.map(String),
+      SourceCode: sourceWithStatuses,
+      AttributeSource: parsed.AttributeSource || method.AttributeSource || '',
+      BodyText: unindentMethodBody(parsed.BodyText),
+      PreserveSource: true,
+    });
+    renderAll(); updateWorkspaceHeader(); persistProjectDraft();
+    setStatus('状态码已同步到方法库和所有绑定节点。', 'normal');
+    return statuses;
+  }
+
   function renderInspector() {
     const root = $('#nodeEditor');
     const empty = $('#inspectorEmpty');
@@ -2416,6 +2468,7 @@
     const statusHelp = method && method.ReturnType === 'bool' ? 'bool 判断返回 true / false；两个分支都需要连接。' : resultCodes.length
       ? `返回状态：${resultCodes.map(code => alarmCodes.includes(code) ? `${code} 报警` : String(code)).join('、')}${pendingCodes.length ? `；等待状态：${pendingCodes.join('、')}` : ''}。每个非等待状态都必须显式连接。`
       : '方法按当前机种和工站筛选；状态码由方法 int 返回值驱动后续分支。';
+    const editableResultStatuses = method && method.ReturnType === 'int';
     const typeOptions = ['Start', 'Action', 'Condition', 'Wait', 'Alarm', 'End']
       .map(type => `<option value="${type}" ${node.NodeType === type ? 'selected' : ''}>${typeLabel(type)}</option>`).join('');
     root.innerHTML = `<div class="inspector-title-row"><span class="inspector-kind">${node.NodeType === 'Start' ? '▶' : node.NodeType === 'End' ? '■' : 'ƒ'}</span>
@@ -2423,7 +2476,8 @@
         <button class="delete-node" id="deleteNode" title="删除节点">⌫</button></div>
       <div class="field"><label for="nodeName">节点名称${control ? '（固定）' : ''}</label><input id="nodeName" data-node-field="DisplayName" value="${esc(node.DisplayName)}" maxlength="256" ${control ? 'disabled' : ''}></div>
       <div class="field"><label for="nodeType">节点类型</label><select id="nodeType" data-node-field="NodeType">${typeOptions}</select></div>
-      ${executable ? `<div class="field"><label for="methodId">绑定方法 ID</label><select id="methodId" data-node-field="MethodId"><option value="">选择已注册方法</option>${methodOptions}</select><span class="field-help">${esc(statusHelp)}</span></div>
+      ${executable ? `<div class="field"><label for="methodId">绑定方法 ID</label><select id="methodId" data-node-field="MethodId"><option value="">选择已注册方法</option>${methodOptions}</select><span class="field-help">${esc(editableResultStatuses ? `状态码与方法库共享，修改后所有绑定节点同步更新。${statusHelp}` : statusHelp)}</span></div>
+        ${editableResultStatuses ? `<div class="field node-status-field"><span>方法返回状态码</span><div id="nodeResultStatusEditor" class="status-code-editor" data-status-editor="node"></div><input id="nodeStatusCodesInput" type="hidden" value="${esc(window.EquipmentFlowMethodStatuses.normalizeResultStatusCodes(resultCodes).join(', '))}"><span class="field-help node-status-help">0 为必需状态；新增状态后，可在下方添加对应输出分支。</span></div>` : ''}
         <div class="field-row"><div class="field"><label for="pendingStatus">等待状态码</label><input id="pendingStatus" inputmode="numeric" data-node-field="PendingStatusCode" value="${esc(getNodeFieldValue(node, 'PendingStatusCode'))}" placeholder="可留空"></div>
           <div class="field"><label for="timeoutMs">超时毫秒</label><input id="timeoutMs" inputmode="numeric" data-node-field="TimeoutMilliseconds" value="${esc(getNodeFieldValue(node, 'TimeoutMilliseconds'))}" placeholder="可留空"></div></div>
         <div class="field"><label for="failurePolicy">失败处理</label><select id="failurePolicy" data-node-field="FailurePolicy"><option value="Fault" ${(node.FailurePolicy || 'Fault') === 'Fault' ? 'selected' : ''}>Fault · 停止并报警</option><option value="Transition" ${node.FailurePolicy === 'Transition' ? 'selected' : ''}>Transition · 走失败分支</option></select></div>
@@ -2452,6 +2506,13 @@
     if (deleteButton) deleteButton.addEventListener('click', deleteSelectedNode);
     const addTransitionButton = $('#addTransition', root);
     if (addTransitionButton) addTransitionButton.addEventListener('click', addTransition);
+    const nodeStatusEditor = $('#nodeResultStatusEditor', root);
+    if (nodeStatusEditor && method) renderStatusCodeEditor(nodeStatusEditor, resultCodes, next => {
+      const updated = applyMethodResultStatusCodes(method, next);
+      const hidden = $('#nodeStatusCodesInput', root);
+      if (hidden) hidden.value = updated.join(', ');
+      return updated;
+    });
   }
 
   function renderParameterFields(node, method) {
@@ -4488,7 +4549,13 @@
       : ['override', 'abstract', 'virtual'].find(value => methodModifiers.includes(value)) || '';
     $('#methodModifierInput').value = method?.MethodModifier || methodModifier;
     setMethodReturnTypeForm(method ? method.ReturnType || 'void' : 'int');
-    $('#methodStatusCodesInput').value = method ? (method.ResultStatusCodes || []).join(', ') : '0, 1';
+    const initialStatuses = window.EquipmentFlowMethodStatuses.normalizeResultStatusCodes(method ? method.ResultStatusCodes || [] : [0, 1]);
+    $('#methodStatusCodesInput').value = initialStatuses.join(', ');
+    renderStatusCodeEditor($('#methodStatusEditor'), initialStatuses, next => {
+      const accepted = window.EquipmentFlowMethodStatuses.validateResultStatusCodesChange(method || {}, next, state.workspace);
+      $('#methodStatusCodesInput').value = accepted.join(', ');
+      return accepted;
+    });
     $('#methodSummaryInput').value = method ? method.DocumentationSummary || '' : '';
     refreshMethodCategorySelect(method ? method.Category || '' : (currentTaskMethodCategories(task)[0]?.Name || ''));
     $('#methodBodyInput').value = method ? window.EquipmentFlowTaskCodegen.methodSource(method) : '';
@@ -4622,10 +4689,12 @@
         methodDialogError('C# 要求必填参数排在可选参数前面，请调整参数顺序或补充默认值。'); return;
       }
     }
-    const statusText = $('#methodStatusCodesInput').value.trim();
-    const statuses = statusText ? statusText.split(/[ ,，;；]+/).filter(Boolean).map(Number) : [];
-    if (statuses.some(code => !Number.isSafeInteger(code))) { methodDialogError('int 返回状态码必须是整数，使用逗号分隔。'); return; }
-    if (returnType === 'int' && !statuses.length) { methodDialogError('int 方法至少配置一个状态码，供流程图分支使用。'); return; }
+    let statuses = [];
+    try {
+      statuses = returnType === 'int'
+        ? window.EquipmentFlowMethodStatuses.validateResultStatusCodesChange(state.editingMethod || {}, $('#methodStatusCodesInput').value, state.workspace)
+        : [];
+    } catch (error) { methodDialogError(error.message); return; }
     const signatureKey = csharpMethodSignatureKey({ MethodName: name, Parameters: parameters });
     const duplicate = state.workspace.Methods.find(item => item.TaskId === task.TaskId && item !== state.editingMethod
       && csharpMethodSignatureKey(item) === signatureKey);
@@ -4672,6 +4741,12 @@
       try { parsedSource = parseMethodCodeEditor(sourceCode); }
       catch (error) { methodDialogError(`无法生成完整函数代码：${error.message}`); return; }
     }
+    if (returnType === 'int') {
+      try {
+        sourceCode = window.EquipmentFlowCSharpCatalog.updateResultStatusCodes(sourceCode, name, statuses);
+        parsedSource = parseMethodCodeEditor(sourceCode);
+      } catch (error) { methodDialogError(`无法保存返回状态码：${error.message}`); return; }
+    }
     const body = unindentMethodBody(parsedSource.BodyText);
     const method = state.editingMethod || {};
     Object.assign(method, {
@@ -4687,9 +4762,10 @@
       SchemaVersion: Number(method.SchemaVersion) || 1,
       Parameters: parameters,
       ParameterModelVersion: 2,
-      ResultStatusCodes: returnType === 'int' ? Array.from(new Set(statuses)) : [],
-      PendingStatusCodes: [], AlarmStatusCodes: [],
-      Outcomes: returnType === 'bool' ? ['true', 'false'] : returnType === 'int' ? Array.from(new Set(statuses)).map(String) : [],
+      ResultStatusCodes: returnType === 'int' ? statuses : [],
+      PendingStatusCodes: returnType === 'int' ? (method.PendingStatusCodes || []).slice() : [],
+      AlarmStatusCodes: returnType === 'int' ? (method.AlarmStatusCodes || []).slice() : [],
+      Outcomes: returnType === 'bool' ? ['true', 'false'] : returnType === 'int' ? statuses.map(String) : [],
       NodeType: returnType === 'bool' ? 'Condition' : 'Action',
       CanBind: true, ContractIssue: '',
       BodyText: body,
@@ -5254,3 +5330,4 @@
   });
   setStatus(state.workspace.Tasks.length ? '已恢复 Task 项目，可继续编辑' : '新建 Task 或导入 Task 模板开始编辑', 'normal');
 })();
+

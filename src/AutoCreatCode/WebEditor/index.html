@@ -279,7 +279,11 @@
           </div>
           <label class="field"><span>方法分类 / #region</span><select id="methodCategoryInput" required><option value="" disabled selected>选择当前 Task 的 Region</option></select></label>
           <div id="methodParametersSection" class="method-parameters-section"><div class="subsection-heading"><strong>参数（顺序与函数调用一致）</strong><button id="addParameterButton" class="catalog-action" type="button">＋ 参数</button></div><p class="method-parameter-help">值传递、in 可设合法默认值；必填参数排在可选参数前。ref 调用前写入配置值，out 由函数赋值后返回。params 只能在末尾。</p><div id="methodParameterRows" class="method-parameter-rows"></div></div>
-          <label class="field method-status-field"><span>int 返回状态码</span><input id="methodStatusCodesInput" type="text" autocomplete="off" placeholder="例如 0, 1, 2"></label>
+          <div id="methodStatusField" class="field method-status-field"><span>int 返回状态码</span>
+            <div id="methodStatusEditor" class="status-code-editor" data-status-editor="method"></div>
+            <small class="field-help">状态码会同步到方法元数据并显示为节点出口；已有连线或等待/报警分类引用的状态不能删除。</small>
+            <input id="methodStatusCodesInput" type="hidden" value="0, 1">
+          </div>
           <label class="field"><span>方法注释</span><input id="methodSummaryInput" type="text" maxlength="240" placeholder="例如：移动到指定工艺点并确认到位"></label>
         </section>
         <div id="methodCodePanelHome" class="method-code-panel-home">
@@ -440,6 +444,7 @@
   <script src="csharp-catalog.js"></script>
   <script src="task-template.js"></script>
   <script src="method-library.js"></script>
+  <script src="method-status-codes.js"></script>
   <script src="parameter-bindings.js"></script>
   <script src="hardware-library.js"></script>
   <script src="task-codegen.js"></script>
@@ -452,3 +457,4 @@
   <script src="editor.js"></script>
 </body>
 </html>
+
