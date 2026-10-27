@@ -1,4 +1,5 @@
 $ErrorActionPreference = 'Stop'
+$appVersion = '__VERSION__'
 
 function Show-InstallerMessage([string]$Text, [System.Windows.Forms.MessageBoxIcon]$Icon = [System.Windows.Forms.MessageBoxIcon]::Information) {
     [void][System.Windows.Forms.MessageBox]::Show(
@@ -67,13 +68,15 @@ function Invoke-Prerequisite([string]$Path, [string[]]$Arguments, [string]$Name)
 Add-Type -AssemblyName System.Windows.Forms
 
 try {
+    Write-Host "正在安装 AutoCreatCode V$appVersion..."
     if (-not [Environment]::Is64BitOperatingSystem) {
-        throw 'AutoCreatCode V1.0 需要 64 位 Windows。'
+        throw "AutoCreatCode V$appVersion 需要 64 位 Windows。"
     }
 
     if (-not (Test-IsAdministrator)) {
-        $arguments = '-NoLogo -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $PSCommandPath + '"'
-        $process = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -Verb RunAs -ArgumentList $arguments -WindowStyle Hidden -Wait -PassThru
+        Write-Host '正在请求管理员权限...'
+        $arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -File "' + $PSCommandPath + '"'
+        $process = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -Verb RunAs -ArgumentList $arguments -WindowStyle Normal -Wait -PassThru
         exit $process.ExitCode
     }
 
@@ -90,11 +93,13 @@ try {
     $payloadRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('AutoCreatCode-Install-' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $payloadRoot -Force | Out-Null
     try {
+        Write-Host '正在解压安装文件...'
         Expand-Archive -LiteralPath $payloadZip -DestinationPath $payloadRoot -Force
         $prerequisiteRoot = Join-Path $payloadRoot 'prerequisites'
         $restartRequired = $false
 
         if (-not (Test-DotNetFramework48)) {
+            Write-Host '正在安装 .NET Framework 4.8...'
             $code = Invoke-Prerequisite (Join-Path $prerequisiteRoot 'NDP48-x86-x64-AllOS-ENU.exe') @('/q', '/norestart') '.NET Framework 4.8'
             if ($code -in @(3010, 1641)) { $restartRequired = $true }
             if (-not (Test-DotNetFramework48) -and -not $restartRequired) {
@@ -103,6 +108,7 @@ try {
         }
 
         if (-not (Test-WebView2Runtime)) {
+            Write-Host '正在安装 Microsoft Edge WebView2 Runtime...'
             $code = Invoke-Prerequisite (Join-Path $prerequisiteRoot 'MicrosoftEdgeWebView2RuntimeInstallerX64.exe') @('/silent', '/install') 'WebView2 Runtime'
             if ($code -in @(3010, 1641)) { $restartRequired = $true }
             if (-not (Test-WebView2Runtime)) {
@@ -117,6 +123,7 @@ try {
         }
 
         $installRoot = Join-Path $env:ProgramW6432 'AutoCreatCode'
+        Write-Host "正在安装程序文件到 $installRoot ..."
         New-Item -ItemType Directory -Path $installRoot -Force | Out-Null
         Copy-Item -Path (Join-Path $appRoot '*') -Destination $installRoot -Recurse -Force
         Copy-Item -LiteralPath (Join-Path $payloadRoot 'Uninstall.ps1') -Destination (Join-Path $installRoot 'Uninstall.ps1') -Force
@@ -140,8 +147,8 @@ try {
 
         $uninstallKey = [Microsoft.Win32.Registry]::LocalMachine.CreateSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\AutoCreatCode')
         try {
-            $uninstallKey.SetValue('DisplayName', 'AutoCreatCode V1.0')
-            $uninstallKey.SetValue('DisplayVersion', '1.0')
+            $uninstallKey.SetValue('DisplayName', "AutoCreatCode V$appVersion")
+            $uninstallKey.SetValue('DisplayVersion', $appVersion)
             $uninstallKey.SetValue('InstallLocation', $installRoot)
             $uninstallKey.SetValue('DisplayIcon', (Join-Path $installRoot 'AutoCreatCode.exe'))
             $uninstallKey.SetValue('UninstallString', ('powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "' + (Join-Path $installRoot 'Uninstall.ps1') + '"'))
@@ -150,7 +157,7 @@ try {
         }
         finally { $uninstallKey.Dispose() }
 
-        $message = 'AutoCreatCode 安装完成。桌面和开始菜单已创建快捷方式。'
+        $message = "AutoCreatCode V$appVersion 安装完成。桌面和开始菜单已创建快捷方式。"
         if ($restartRequired) { $message += "`r`n`r`n.NET 安装程序要求重启，请先重启 Windows 后再启动 AutoCreatCode。" }
         Show-InstallerMessage $message
     }
@@ -161,6 +168,7 @@ try {
     }
 }
 catch {
+    Write-Host "`r`n安装失败：$($_.Exception.Message)" -ForegroundColor Red
     Show-InstallerMessage ("安装未完成：`r`n" + $_.Exception.Message) ([System.Windows.Forms.MessageBoxIcon]::Error)
     exit 1
 }

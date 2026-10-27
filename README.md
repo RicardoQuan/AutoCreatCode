@@ -2,13 +2,13 @@
 
 AutoCreatCode 是一个以浏览器为主要开发和优化入口的流程编辑器。HTML、CSS、JavaScript 与本地 Monaco 编辑器构成唯一的界面实现；Windows 桌面版通过轻量的 WinForms + WebView2 窗口加载同一套页面，不另做一套原生编辑器。
 
-## 获取 V1.0
+## 获取 V1.1
 
-- [下载 Windows 离线安装包](https://github.com/RicardoQuan/AutoCreatCode/releases/download/v1.0/AutoCreatCode-Setup-v1.0.exe)
-- [下载项目源码压缩包](https://github.com/RicardoQuan/AutoCreatCode/releases/download/v1.0/AutoCreatCode-Source-v1.0.zip)
+- [下载 Windows 离线安装包](https://github.com/RicardoQuan/AutoCreatCode/releases/download/v1.1/AutoCreatCode-Setup-v1.1.exe)
+- [下载项目源码压缩包](https://github.com/RicardoQuan/AutoCreatCode/releases/download/v1.1/AutoCreatCode-Source-v1.1.zip)
 - [查看全部版本](https://github.com/RicardoQuan/AutoCreatCode/releases)
 
-安装包支持 64 位 Windows 10/11。首次安装时会自动补齐缺失的 .NET Framework 4.8 与 WebView2 Runtime，并创建桌面和开始菜单快捷方式。安装包离线包含这些依赖；后续安装不需要连接网络。
+安装包支持 64 位 Windows 10/11。安装程序会显示启动和依赖安装进度，首次安装时自动补齐缺失的 .NET Framework 4.8 与 WebView2 Runtime，并创建桌面和开始菜单快捷方式。安装包离线包含这些依赖；后续安装不需要连接网络。
 
 ## 浏览器开发
 

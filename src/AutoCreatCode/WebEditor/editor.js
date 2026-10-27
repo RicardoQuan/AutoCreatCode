@@ -25,6 +25,7 @@
   };
   let methodCodeEditor = null;
   let methodDialogBaseline = '';
+  let taskVariablesDialogBaseline = '';
   let methodSelectionAnchor = '';
   let editingHardwareId = '';
   let hardwareDialogSlots = [];
@@ -32,6 +33,7 @@
   let hardwareDialogNozzles = [];
   let selectedHardwareNozzleId = '';
   let hardwareDialogVariables = [];
+  let methodCustomVariables = [];
   const selectedMethodIds = new Set();
   const state = {
     workspace: null,
@@ -40,6 +42,7 @@
     stationId: null,
     editingMethod: null,
     pendingTaskTemplate: null,
+    pendingTaskCopySourceId: '',
     selectedNodeId: null,
     activeInspector: 'node',
     layout: {},
@@ -81,6 +84,60 @@
 
   function currentTask() {
     return state.workspace && (state.workspace.Tasks || []).find(task => task.TaskId === state.stationId);
+  }
+
+  function taskBaseTypeIdentity(typeName) {
+    const value = String(typeName || '').trim().replace(/^global::/, '').replace(/\s+/g, '');
+    if (!value) return '';
+    if (value.toLowerCase() === 'taskbase_moverstation') return 'botech.taskbase_moverstation';
+    return value.toLowerCase();
+  }
+
+  function isDefaultTaskBase(typeName) {
+    const value = String(typeName || '').trim().replace(/^global::/, '').replace(/\s+/g, '').toLowerCase();
+    return value === 'taskbase_moverstation' || value === 'botech.taskbase_moverstation';
+  }
+
+  function taskInheritsAutoRun(task) {
+    if (!task?.BaseType) return false;
+    let typeName = String(task.BaseType).trim();
+    const visited = new Set();
+    while (typeName) {
+      const identity = taskBaseTypeIdentity(typeName);
+      if (!identity || visited.has(identity)) return false;
+      visited.add(identity);
+      if (isDefaultTaskBase(typeName)) return true;
+      const definition = baseTypeDefinition(typeName);
+      const hasInheritedAutoRun = definition.methods.some(method =>
+        String(method.MethodName || method.name || '').toLowerCase() === 'autorun'
+        && String(method.AccessModifier || '').toLowerCase() !== 'private'
+        && !methodModifierSet(method).has('static'));
+      if (hasInheritedAutoRun) return true;
+      typeName = String(definition.BaseType || '').trim();
+    }
+    return false;
+  }
+
+  function flowHasExecutableNodes(flow) {
+    return Boolean(flow && (flow.Nodes || []).some(node => node && !['Start', 'End'].includes(node.NodeType)));
+  }
+
+  function taskUsesInheritedAutoRun(task, flow = currentFlow()) {
+    return taskInheritsAutoRun(task) && !flowHasExecutableNodes(flow);
+  }
+
+  function flowForTaskGeneration(task, flow) {
+    return taskUsesInheritedAutoRun(task, flow) ? null : flow;
+  }
+
+  function createTaskFlow(task) {
+    const flow = window.EquipmentFlowTaskCodegen.defaultFlow(task);
+    if (taskInheritsAutoRun(task)) {
+      flow.EntryNodeId = '';
+      flow.Nodes = [];
+      flow.Transitions = [];
+    }
+    return flow;
   }
 
   function nodeDraftKey(flow, nodeId, field) {
@@ -225,6 +282,7 @@
   // Workspace startup, recovery, and normalization of older saved projects.
   function initializeEditor() {
     loadPanelState();
+    let repairedFlows = [];
     state.workspace = {
       MachineName: '', PackageName: '', PackageVersion: '1.0.0',
       Stations: [], Tasks: [], Methods: [], MethodFiles: [], Hardware: [],
@@ -234,7 +292,13 @@
     try {
       const saved = JSON.parse(localStorage.getItem('botech.task-editor.project') || 'null');
       if (saved && saved.format === 'BoTech.TaskEditorProject' && saved.workspace) {
+        const savedFlows = Array.isArray(saved.workspace.Flows) ? saved.workspace.Flows : [];
+        const previousEntries = new Map(savedFlows.map(flow => [`${flow.StationId || ''}\u0000${flow.FlowId || ''}`, flow.EntryNodeId]));
         state.workspace = normalizeWorkspace(saved.workspace);
+        repairedFlows = state.workspace.Flows.filter(flow => {
+          const key = `${flow.StationId || ''}\u0000${flow.FlowId || ''}`;
+          return previousEntries.has(key) && previousEntries.get(key) !== flow.EntryNodeId;
+        });
         state.stationId = saved.activeTaskId || (state.workspace.Tasks[0] && state.workspace.Tasks[0].TaskId) || '';
       }
     } catch (_) { /* Ignore an invalid or unavailable browser draft. */ }
@@ -243,6 +307,11 @@
       state.projectSavedLabel = localStorage.getItem(PROJECT_SAVED_LABEL_KEY) || '';
     } catch (_) { state.projectDirty = true; }
     restoreTaskSaveStates();
+    if (repairedFlows.length) {
+      new Set(repairedFlows.map(flow => flow.StationId).filter(Boolean)).forEach(taskId => markProjectDirty(taskId));
+      try { localStorage.setItem('botech.task-editor.project', JSON.stringify(projectSnapshot())); }
+      catch (_) { /* Keep the in-memory repair if browser storage is unavailable. */ }
+    }
     updateProjectSaveStatus();
     $('#stationCount').textContent = '0';
     $('#methodCount').textContent = '0';
@@ -260,7 +329,10 @@
     let preferredView = 'flow';
     try { preferredView = localStorage.getItem('botech.task-editor.active-view') || 'flow'; } catch (_) { /* Keep the default view when storage is unavailable. */ }
     setWorkspaceView(preferredView === 'enum' ? 'enum' : 'flow');
-    setStatus(state.workspace.Tasks.length ? '已恢复 Task 项目，可继续编辑' : '新建 Task 或导入 Task 模板开始编辑', 'normal');
+    setStatus(repairedFlows.length
+      ? `已自动修正 ${repairedFlows.length} 个流程入口，请保存项目`
+      : state.workspace.Tasks.length ? '已恢复 Task 项目，可继续编辑' : '新建 Task 或导入 Task 模板开始编辑',
+    repairedFlows.length ? 'warning' : 'normal');
   }
 
   function normalizeWorkspace(workspace) {
@@ -297,16 +369,35 @@
       task.ClassName = String(task.ClassName || task.Name || 'Task').trim() || 'Task';
       task.OutputDirectoryPath = String(task.OutputDirectoryPath || '');
       task.OutputDirectoryName = String(task.OutputDirectoryName || '');
-      task.BaseType = String(task.BaseType || 'TaskBase_MoverStation').trim() || 'TaskBase_MoverStation';
+      task.BaseType = Object.prototype.hasOwnProperty.call(task, 'BaseType')
+        ? String(task.BaseType || '').trim()
+        : 'TaskBase_MoverStation';
+      task.SourceBaseType = Object.prototype.hasOwnProperty.call(task, 'SourceBaseType')
+        ? String(task.SourceBaseType || '').trim()
+        : task.BaseType;
       task.AccessModifier = ['public', 'internal'].includes(task.AccessModifier) ? task.AccessModifier : 'public';
       task.ClassModifier = ['abstract', 'sealed'].includes(task.ClassModifier) ? task.ClassModifier : '';
       if (!Array.isArray(task.MethodCategories)) task.MethodCategories = [];
-      const common = task.MethodCategories.find(item => ['common', '通用'].includes(String(item.Name || '').toLowerCase()));
-      if (common) { common.Name = 'Common'; common.RegionName = 'Common'; common.Order = 0; }
-      else task.MethodCategories.push({ Name: 'Common', RegionName: 'Common', Order: 0 });
-      task.MethodCategories.forEach((item, index) => { if (item !== common && item.Order == null) item.Order = index + 1; });
-      result.Methods.filter(method => method.TaskId === task.TaskId && ['common', '通用'].includes(String(method.Category || '').toLowerCase()))
-        .forEach(method => { method.Category = 'Common'; });
+      task.MethodCategories = task.MethodCategories.map((item, index) => {
+        const category = typeof item === 'string' ? { Name: item, RegionName: item, Order: index }
+          : item && typeof item === 'object' ? item : null;
+        if (!category) return null;
+        category.Name = String(category.Name || category.RegionName || '').trim();
+        category.RegionName = category.Name;
+        if (category.Order == null || !Number.isFinite(Number(category.Order))) category.Order = index;
+        return category;
+      }).filter(category => category && category.Name);
+      if (!task.MethodCategories.length) task.MethodCategories.push({ Name: 'Common', RegionName: 'Common', Order: 0 });
+      const legacyVariables = result.Methods.filter(method => method.TaskId === task.TaskId && Array.isArray(method.CustomVariables))
+        .flatMap(method => method.CustomVariables);
+      const taskVariables = Array.isArray(task.MethodVariables) ? task.MethodVariables.slice() : [];
+      const variableNames = new Set(taskVariables.map(variable => String(variable.Name || '').toLowerCase()));
+      legacyVariables.forEach(variable => {
+        const key = String(variable.Name || '').toLowerCase();
+        if (!variableNames.has(key)) { taskVariables.push(variable); variableNames.add(key); }
+      });
+      task.MethodVariables = taskVariables;
+      result.Methods.filter(method => method.TaskId === task.TaskId).forEach(method => { delete method.CustomVariables; });
     });
     result.MethodFiles = Array.isArray(result.MethodFiles) ? result.MethodFiles : [];
     result.EnumWorkbooks = Array.isArray(result.EnumWorkbooks) ? result.EnumWorkbooks : [];
@@ -322,6 +413,7 @@
     result.Flows.forEach(flow => {
       if (!flow || !Array.isArray(flow.Nodes)) return;
       if (!Array.isArray(flow.Transitions)) flow.Transitions = [];
+      window.EquipmentFlowCanvas.synchronizeEntryNode(flow);
       flow.Nodes.forEach(node => {
         if (node && node.NodeType === 'Start') node.DisplayName = '开始';
         else if (node && node.NodeType === 'End') node.DisplayName = '结束';
@@ -351,7 +443,9 @@
     const task = currentTask();
     updateProjectSaveStatus();
     $('#stationCount').textContent = String((state.workspace.Tasks || []).length);
-    $('#methodCount').textContent = String((state.workspace.Methods || []).filter(method => !task || method.TaskId === task.TaskId).length);
+    const taskMethods = (state.workspace.Methods || []).filter(method => !task || taskOwnsMethod(method, task.TaskId));
+    const inheritedMethods = task ? inheritedMethodsForTask(task) : [];
+    $('#methodCount').textContent = String(taskMethods.length + inheritedMethods.filter(item => !item.local).length);
     renderTaskClassSettings(task);
     $('#taskOutputDirectoryInput').value = task
       ? taskOutputDirectoryLabel(task)
@@ -364,11 +458,20 @@
       const button = $('#' + id);
       if (button) button.disabled = !task;
     });
+    const flowSourceButton = $('#flowSourceButton');
+    if (flowSourceButton) {
+      const inheritedOnly = taskUsesInheritedAutoRun(task, currentFlow());
+      flowSourceButton.disabled = !task || inheritedOnly;
+      flowSourceButton.title = inheritedOnly ? '此 Task 继承父类 AutoRun，无需生成流程 .cs' : '生成流程 .cs';
+    }
     $('#saveAsProjectButton').disabled = !(state.workspace.Tasks || []).length;
     $('#newMethodButton').disabled = !task;
+    $('#manageTaskVariablesButton').disabled = !task;
     $('#importMethodsButton').disabled = !task;
     $('#manageMethodRegionsButton').disabled = !task;
     $('#deleteTaskButton').disabled = !task;
+    $('#copyTaskAsNewButton').disabled = !task;
+    $('#copyTaskIntoExistingButton').disabled = !task || (state.workspace.Tasks || []).length < 2;
     $('#chooseTaskOutputDirectoryButton').disabled = !task;
     $('#hardwareCreateButton').disabled = !task;
     $('#hardwareImportButton').disabled = !task;
@@ -384,9 +487,10 @@
       const name = String(typeName || '').trim();
       if (!name || name === `${task.Namespace || 'BoTech'}.${task.ClassName}` || name === task.ClassName) return;
       if (modifier === 'sealed' || modifier === 'static') return;
-      if (!candidates.has(name)) candidates.set(name, label);
+      const identity = taskBaseTypeIdentity(name);
+      if (!candidates.has(identity)) candidates.set(identity, { value: name, label });
     };
-    addCandidate('TaskBase_MoverStation', 'TaskBase_MoverStation · 默认运行基类');
+    addCandidate('BoTech.TaskBase_MoverStation', 'TaskBase_MoverStation · 默认运行基类');
     (state.workspace?.Tasks || []).forEach(candidate => {
       if (candidate.TaskId === task.TaskId) return;
       const fullName = `${candidate.Namespace || 'BoTech'}.${candidate.ClassName}`;
@@ -401,8 +505,10 @@
       } catch (_) { /* One incomplete template file must not hide the other base type choices. */ }
     });
     const current = String(task.BaseType || '').trim();
-    if (current && !candidates.has(current)) candidates.set(current, `${current} · 当前基类`);
-    return Array.from(candidates.entries()).map(([value, label]) => ({ value, label }));
+    const currentIdentity = taskBaseTypeIdentity(current);
+    if (current && !candidates.has(currentIdentity))
+      candidates.set(currentIdentity, { value: current, label: `${current} · 当前基类` });
+    return Array.from(candidates.values());
   }
 
   function renderTaskClassSettings(task) {
@@ -423,19 +529,25 @@
       return;
     }
     const options = taskBaseTypeOptions(task);
-    const base = String(task.BaseType || 'TaskBase_MoverStation');
-    baseSelect.innerHTML = options.map(item => `<option value="${esc(item.value)}">${esc(item.label)}</option>`).join('')
+    const base = String(task.BaseType || '').trim();
+    baseSelect.innerHTML = '<option value="">无基类</option>'
+      + options.map(item => `<option value="${esc(item.value)}">${esc(item.label)}</option>`).join('')
       + `<option value="${CUSTOM_TASK_BASE}">自定义类型…</option>`;
-    const isKnownBase = options.some(item => item.value === base);
-    baseSelect.value = isKnownBase ? base : CUSTOM_TASK_BASE;
+    const knownBase = options.find(item => taskBaseTypeIdentity(item.value) === taskBaseTypeIdentity(base));
+    const isKnownBase = !base || Boolean(knownBase);
+    baseSelect.value = !base ? '' : isKnownBase ? knownBase.value : CUSTOM_TASK_BASE;
     customBase.value = isKnownBase ? '' : base;
     customBase.disabled = isKnownBase;
     customBase.classList.toggle('hidden', isKnownBase);
     modifierSelect.value = ['abstract', 'sealed'].includes(task.ClassModifier) ? task.ClassModifier : '';
     accessSelect.value = task.AccessModifier === 'internal' ? 'internal' : 'public';
-    hint.textContent = task.ClassModifier === 'abstract'
-      ? 'abstract 类不能直接实例化，适用于抽象基类或模板。'
-      : task.ClassModifier === 'sealed' ? 'sealed 类不能再作为其他 Task 的基类。' : '';
+    hint.textContent = !base
+      ? '当前 Task 不继承基类；流程运行所需的 StaInfo、SetStep 等成员需由当前 Task 提供。'
+      : taskUsesInheritedAutoRun(task)
+        ? `继承父类 ${base} 的 AutoRun；当前 Task 无需绘制或生成流程 AutoRun。`
+      : task.ClassModifier === 'abstract'
+        ? 'abstract 类不能直接实例化，适用于抽象基类或模板。'
+        : task.ClassModifier === 'sealed' ? 'sealed 类不能再作为其他 Task 的基类。' : '';
   }
 
   function isValidTaskBaseType(value) {
@@ -464,12 +576,12 @@
     const task = currentTask();
     if (!task) return false;
     const next = String(value || '').trim();
-    if (field === 'BaseType' && !isValidTaskBaseType(next)) {
+    if (field === 'BaseType' && next && !isValidTaskBaseType(next)) {
       setStatus('继承类型需要是有效的 C# 类型名，例如 TaskBase_MoverStation 或 Namespace.BaseTask。', 'error');
       renderTaskClassSettings(task);
       return false;
     }
-    if (field === 'BaseType') {
+    if (field === 'BaseType' && next) {
       const selfNames = new Set([task.ClassName, `${task.Namespace || 'BoTech'}.${task.ClassName}`]);
       if (selfNames.has(next)) {
         setStatus('Task 不能继承自身。', 'error');
@@ -516,6 +628,7 @@
     }
     task[field] = normalized;
     renderTaskClassSettings(task);
+    if (field === 'BaseType') { renderMethods(); updateWorkspaceHeader(); }
     persistProjectDraft();
     setStatus(`已更新 ${task.ClassName} 的 ${field === 'BaseType' ? '继承类型' : field === 'AccessModifier' ? '访问级别' : '类修饰符'}。`, 'normal');
     return true;
@@ -540,40 +653,41 @@
     const normalized = String(name || '').trim();
     if (!task || !normalized || /[\r\n]|#(?:end)?region/i.test(normalized)) return false;
     if (!Array.isArray(task.MethodCategories)) task.MethodCategories = [];
-    if (task.MethodCategories.some(item => String(item.Name || '').toLowerCase() === normalized.toLowerCase())) return false;
-    task.MethodCategories.push({ Name: normalized, RegionName: normalized, Order: task.MethodCategories.length });
+    if (task.MethodCategories.some(item => String(typeof item === 'string' ? item : item && (item.Name || item.RegionName) || '').toLowerCase() === normalized.toLowerCase())) return false;
+    const nextOrder = task.MethodCategories.reduce((maximum, item) => Math.max(maximum, Number(typeof item === 'string' ? 0 : item.Order) || 0), -1) + 1;
+    task.MethodCategories.push({ Name: normalized, RegionName: normalized, Order: nextOrder });
     return true;
   }
 
   function syncTaskMethodCategories(task, additionalNames = []) {
     if (!task) return [];
     if (!Array.isArray(task.MethodCategories)) task.MethodCategories = [];
-    task.MethodCategories.forEach(item => {
-      if (String(item.Name || '').toLowerCase() === '通用') { item.Name = 'Common'; item.RegionName = 'Common'; }
+    const seen = new Set();
+    task.MethodCategories = task.MethodCategories.filter(item => {
+      const name = String(typeof item === 'string' ? item : item && (item.Name || item.RegionName) || '').trim();
+      const key = name.toLowerCase();
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    }).map((item, index) => {
+      const category = typeof item === 'string' ? { Name: item, RegionName: item, Order: index } : item;
+      category.Name = String(category.Name || category.RegionName || '').trim();
+      category.RegionName = category.Name;
+      if (category.Order == null || !Number.isFinite(Number(category.Order))) category.Order = index;
+      return category;
     });
-    task.MethodCategories = task.MethodCategories.filter((item, index, items) =>
-      String(item.Name || '').toLowerCase() !== 'common' || items.findIndex(candidate => String(candidate.Name || '').toLowerCase() === 'common') === index
-    );
-    if (!task.MethodCategories.some(item => String(item.Name || '').toLowerCase() === 'common'))
-      task.MethodCategories.unshift({ Name: 'Common', RegionName: 'Common', Order: 0 });
-    const common = task.MethodCategories.find(item => String(item.Name || '').toLowerCase() === 'common');
-    if (common) { common.Name = 'Common'; common.RegionName = 'Common'; common.Order = 0; }
+    if (!task.MethodCategories.length) task.MethodCategories.push({ Name: 'Common', RegionName: 'Common', Order: 0 });
     const methodNames = (state.workspace?.Methods || [])
       .filter(method => method.TaskId === task.TaskId)
-      .map(method => {
-        if (String(method.Category || '').toLowerCase() === '通用') method.Category = 'Common';
-        return method.Category;
-      });
+      .map(method => method.Category);
     [...additionalNames, ...methodNames].forEach(name => addTaskMethodCategory(task, name));
     return task.MethodCategories;
   }
 
   function currentTaskMethodCategories(task = currentTask()) {
-    return syncTaskMethodCategories(task).slice().sort((left, right) => {
-      if (left.Name === 'Common') return -1;
-      if (right.Name === 'Common') return 1;
-      return (Number(left.Order) || 0) - (Number(right.Order) || 0);
-    });
+    return syncTaskMethodCategories(task).map((category, index) => ({ category, index }))
+      .sort((left, right) => (Number(left.category.Order) || 0) - (Number(right.category.Order) || 0) || left.index - right.index)
+      .map(item => item.category);
   }
 
   function refreshMethodCategorySelect(selectedName = '') {
@@ -587,6 +701,55 @@
     else if (categories.length) select.value = categories[0].Name;
   }
 
+  function normalizedMethodImportSource(method) {
+    const source = String(method.SourceCode || window.EquipmentFlowTaskCodegen.methodSource(method) || '');
+    const tokens = window.EquipmentFlowCSharpCatalog.tokenize(source);
+    const parts = [];
+    let previousEnd = 0;
+    const appendComments = text => {
+      const comments = text.match(/\/\/[^\r\n]*|\/\*[\s\S]*?\*\//g) || [];
+      comments.forEach(comment => parts.push(`comment:${JSON.stringify(comment.replace(/\s+/g, ' ').trim())}`));
+    };
+    tokens.forEach(token => {
+      appendComments(source.slice(previousEnd, token.start));
+      const value = ['string', 'char'].includes(token.kind) ? source.slice(token.start, token.end) : token.value;
+      parts.push(`${token.kind}:${JSON.stringify(value)}`);
+      previousEnd = token.end;
+    });
+    appendComments(source.slice(previousEnd));
+    return parts.join('|');
+  }
+
+  function normalizedMethodImportUsings(method) {
+    return JSON.stringify(Array.from(new Set((method.ImportedUsings || []).map(using =>
+      window.EquipmentFlowCSharpCatalog.tokenize(String(using || '')).map(token =>
+        `${token.kind}:${JSON.stringify(['string', 'char'].includes(token.kind) ? String(using).slice(token.start, token.end) : token.value)}`
+      ).join('|')
+    ))).sort());
+  }
+
+  function importedMethodDifferences(existing, incoming) {
+    const differences = [];
+    const normalizeText = value => String(value || '').replace(/\s+/g, ' ').trim();
+    const parameterSignature = method => JSON.stringify([
+      method.ReturnType || '', method.MethodName || '', (method.Parameters || []).map(parameter => [
+        parameter.Direction || 'value', normalizeText(parameter.TypeName), Boolean(parameter.IsParams), normalizeText(parameter.DefaultValue),
+      ]),
+    ]);
+    if (parameterSignature(existing) !== parameterSignature(incoming)) differences.push('函数签名');
+    if (normalizedMethodImportSource(existing) !== normalizedMethodImportSource(incoming)) differences.push('函数代码');
+    if (normalizeText(existing.DocumentationSummary) !== normalizeText(incoming.DocumentationSummary)) differences.push('方法注释');
+    if (String(existing.Category || '').trim() !== String(incoming.Category || '').trim()) differences.push('Region');
+    if (String(existing.DisplayName || '') !== String(incoming.DisplayName || '')) differences.push('显示名称');
+    if (String(existing.MethodId || '') !== String(incoming.MethodId || '')) differences.push('方法 ID');
+    if (Number(existing.SchemaVersion || 1) !== Number(incoming.SchemaVersion || 1)) differences.push('方法版本');
+    const statusMetadata = method => JSON.stringify([
+      method.ResultStatusCodes || [], method.PendingStatusCodes || [], method.AlarmStatusCodes || [],
+    ]);
+    if (statusMetadata(existing) !== statusMetadata(incoming)) differences.push('状态码配置');
+    return differences;
+  }
+
   async function importMethodLibrary(files) {
     const selected = Array.from(files || []);
     const task = currentTask();
@@ -595,11 +758,34 @@
       throw new Error('方法库只接受一个或多个 C# .cs 文件。');
     const parsedFiles = [];
     const parsedMethods = [];
+    const parsedVariables = [];
+    let ignoredVariableCount = 0;
     for (const file of selected) {
       const source = await file.text();
       const importedUsings = Array.from(source.matchAll(/^\s*using\s+(?:static\s+)?[\w.]+(?:\s*=\s*[\w.]+)?\s*;\s*$/gm), match => match[0].trim());
       const parsed = window.EquipmentFlowCSharpCatalog.parseSource(source, file.name);
       const regions = window.EquipmentFlowTaskTemplate.extractRegions(source, file.name);
+      const variableTypeAliases = new Map([
+        ['bool', 'bool'], ['system.boolean', 'bool'], ['int', 'int'], ['system.int32', 'int'],
+        ['string', 'string'], ['system.string', 'string'], ['long', 'long'], ['system.int64', 'long'],
+        ['float', 'float'], ['system.single', 'float'], ['double', 'double'], ['system.double', 'double'],
+        ['decimal', 'decimal'], ['system.decimal', 'decimal'],
+      ]);
+      parsed.classes.filter(classType => classType.name === task.ClassName && (!classType.namespace || classType.namespace === task.Namespace))
+        .flatMap(classType => classType.memberVariables || []).forEach(variable => {
+          const type = variableTypeAliases.get(String(variable.TypeName || '').replace(/\s+/g, '').toLowerCase());
+          if (!type) { ignoredVariableCount += 1; return; }
+          const region = regions.filter(item => item.Line <= variable.Line && item.EndLine >= variable.Line)
+            .sort((left, right) => right.Depth - left.Depth)[0];
+          const initializer = String(variable.InitializerSource || '').trim();
+          parsedVariables.push({
+            VariableId: `imported_variable_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`,
+            Name: variable.Name, Type: type, MemberKind: variable.MemberKind,
+            AccessModifier: variable.AccessModifier || 'public', Modifiers: variable.Modifiers || [],
+            HasInitialValue: Boolean(initializer), InitialValue: '', InitializerSource: initializer,
+            RegionName: region?.Name || currentTaskMethodCategories(task)[0]?.Name || 'Common', ImportedFileName: file.name,
+          });
+        });
       const classes = parsed.classes.map(classType => ({
         ...classType,
         methods: classType.methods.map(sourceMethod => {
@@ -638,20 +824,138 @@
       }));
       parsedFiles.push({ fileName: file.name, classes, regions, diagnostics: parsed.diagnostics || [] });
     }
-    const existing = new Set(state.workspace.Methods.filter(method => method.TaskId === task.TaskId).map(method => method.MethodId));
-    const duplicates = parsedMethods.filter(method => existing.has(method.MethodId));
-    if (duplicates.length) throw new Error(`当前 Task 已存在方法：${duplicates.map(method => method.MethodName).join('、')}`);
-    state.workspace.Methods.push(...parsedMethods);
+    const taskMethods = state.workspace.Methods.filter(method => method.TaskId === task.TaskId);
+    const existingById = new Map();
+    const existingBySignature = new Map();
+    taskMethods.forEach(method => {
+      if (method.MethodId && !existingById.has(method.MethodId)) existingById.set(method.MethodId, method);
+      const signature = csharpMethodSignatureKey(method);
+      if (signature && !existingBySignature.has(signature)) existingBySignature.set(signature, method);
+    });
+    const plans = [];
+    const plansByExisting = new Map();
+    const plansById = new Map();
+    const plansBySignature = new Map();
+    let identicalMethodCount = 0;
+    parsedMethods.forEach(incoming => {
+      const signature = csharpMethodSignatureKey(incoming);
+      let plan = (incoming.MethodId && plansById.get(incoming.MethodId)) || plansBySignature.get(signature);
+      if (!plan) {
+        const existingMethod = (incoming.MethodId && existingById.get(incoming.MethodId)) || existingBySignature.get(signature);
+        if (existingMethod) plan = plansByExisting.get(existingMethod) || null;
+      }
+      if (!plan) {
+        const existingMethod = (incoming.MethodId && existingById.get(incoming.MethodId)) || existingBySignature.get(signature);
+        plan = {
+          existing: existingMethod || null,
+          preview: existingMethod ? { ...existingMethod } : { ...incoming },
+          differences: new Set(), fileDifferences: new Set(), hasChanges: false, hasIncoming: false,
+        };
+        plans.push(plan);
+        if (existingMethod) plansByExisting.set(existingMethod, plan);
+      }
+      if (!plan.existing && !plan.hasIncoming) {
+        plan.preview = { ...incoming, TaskId: task.TaskId };
+        plan.hasIncoming = true;
+        plansById.set(incoming.MethodId, plan);
+        plansBySignature.set(signature, plan);
+        return;
+      }
+      const differences = importedMethodDifferences(plan.preview, incoming);
+      const usingsChanged = normalizedMethodImportUsings(plan.preview) !== normalizedMethodImportUsings(incoming);
+      if (!differences.length && !usingsChanged) {
+        identicalMethodCount += 1;
+        return;
+      }
+      plan.hasChanges = true;
+      differences.forEach(difference => plan.differences.add(difference));
+      if (usingsChanged) plan.fileDifferences.add('using 引用');
+      plan.preview = {
+        ...incoming,
+        TaskId: task.TaskId,
+        MethodId: incoming.MethodId || plan.preview.MethodId || '',
+        SchemaVersion: Number(incoming.SchemaVersion) || Number(plan.preview.SchemaVersion) || 1,
+      };
+      if (plan.existing) {
+        plansById.set(plan.existing.MethodId, plan);
+        plansById.set(plan.preview.MethodId, plan);
+      }
+      plansById.set(incoming.MethodId, plan);
+      plansBySignature.set(signature, plan);
+      plansBySignature.set(csharpMethodSignatureKey(plan.preview), plan);
+    });
+
+    const updatedExistingMethods = new Set(plans.filter(plan => plan.existing).map(plan => plan.existing));
+    const plannedMethodIds = new Map(taskMethods.filter(method => !updatedExistingMethods.has(method) && method.MethodId)
+      .map(method => [method.MethodId, method]));
+    const plannedSignatures = new Map(taskMethods.filter(method => !updatedExistingMethods.has(method))
+      .map(method => [csharpMethodSignatureKey(method), method]));
+    plans.forEach(plan => {
+      const methodId = String(plan.preview.MethodId || '');
+      const signature = csharpMethodSignatureKey(plan.preview);
+      if (methodId && plannedMethodIds.has(methodId) && plannedMethodIds.get(methodId) !== plan.existing)
+        throw new Error(`导入失败：方法 ${plan.preview.MethodName} 的方法 ID ${methodId} 已被其他方法使用。`);
+      if (signature && plannedSignatures.has(signature) && plannedSignatures.get(signature) !== plan.existing)
+        throw new Error(`导入失败：方法 ${plan.preview.MethodName} 与已有 C# 签名重复。`);
+      if (methodId) plannedMethodIds.set(methodId, plan.existing || plan);
+      if (signature) plannedSignatures.set(signature, plan.existing || plan);
+    });
+
+    const variablesByName = new Map((task.MethodVariables || []).map((variable, index) => [String(variable.Name || '').toLowerCase(), index]));
+    const mergedVariables = (task.MethodVariables || []).slice();
+    parsedVariables.forEach(variable => {
+      const key = String(variable.Name || '').toLowerCase();
+      const existingIndex = variablesByName.get(key);
+      if (existingIndex == null) {
+        variablesByName.set(key, mergedVariables.length);
+        mergedVariables.push(variable);
+      } else mergedVariables[existingIndex] = variable;
+    });
+    task.MethodVariables = mergedVariables;
+    plans.filter(plan => plan.existing).forEach(plan => {
+      const previousMethod = plan.existing;
+      const previousId = previousMethod.MethodId;
+      const nextMethod = plan.preview;
+      if (previousId !== nextMethod.MethodId
+        || Number(previousMethod.SchemaVersion || 1) !== Number(nextMethod.SchemaVersion || 1)
+        || String(previousMethod.MachineName || '') !== String(nextMethod.MachineName || '')
+        || String(previousMethod.StationId || '') !== String(nextMethod.StationId || '')) {
+        state.workspace.Flows.filter(flow => flow.StationId === task.TaskId).forEach(flow => {
+          (flow.Nodes || []).filter(node => node.MethodId === previousId).forEach(node => {
+            node.MethodId = nextMethod.MethodId;
+            node.MethodSchemaVersion = nextMethod.SchemaVersion;
+            node.MethodMachineName = nextMethod.MachineName || '';
+            node.MethodStationId = nextMethod.StationId || '';
+          });
+        });
+      }
+      Object.assign(previousMethod, nextMethod);
+    });
+    const addedMethods = plans.filter(plan => !plan.existing).map(plan => plan.preview);
+    state.workspace.Methods.push(...addedMethods);
     syncTaskMethodCategories(task, [
       ...parsedFiles.flatMap(file => file.regions.filter(region => region.Depth === 0).map(region => region.Name)),
       ...parsedMethods.map(method => method.Category),
+      ...parsedVariables.map(variable => variable.RegionName),
     ]);
     state.workspace.MethodFiles = [...(state.workspace.MethodFiles || []).filter(item => item.taskId !== task.TaskId),
       ...parsedFiles.map(file => ({ ...file, taskId: task.TaskId }))];
     updateWorkspaceHeader();
     renderAll();
     closeDiagnostics();
-    setStatus(`已导入 ${parsedFiles.length} 个 C# 文件，解析到 ${parsedMethods.length} 个 Task 方法；可右键编辑或拖入流程`, 'normal');
+    const changedPlans = plans.filter(plan => plan.hasChanges);
+    setStatus(`已导入 ${parsedFiles.length} 个 C# 文件：新增 ${addedMethods.length} 个方法，更新 ${changedPlans.filter(plan => plan.existing).length} 个，跳过 ${identicalMethodCount} 个相同方法；读取 ${parsedVariables.length} 个类成员变量${ignoredVariableCount ? `，${ignoredVariableCount} 个非支持类型变量未导入` : ''}。`,
+      changedPlans.length || ignoredVariableCount ? 'warning' : 'normal', false);
+    if (changedPlans.length) {
+      appendDiagnosticMessage('以下方法与当前内容不同，已按导入文件更新：', 'warning');
+      changedPlans.filter(plan => plan.differences.size).forEach(plan => appendDiagnosticMessage(
+        `${plan.preview.MethodName || plan.preview.MethodId}：${Array.from(plan.differences).join('、')}`, 'warning'));
+      const changedUsingFiles = new Set(changedPlans.filter(plan => plan.fileDifferences.size)
+        .map(plan => plan.preview.ImportedFileName || '导入的 C# 文件'));
+      changedUsingFiles.forEach(fileName => appendDiagnosticMessage(`${fileName}：using 引用`, 'warning'));
+      window.clearTimeout(diagnosticsHideTimer);
+      diagnosticsHideTimer = null;
+    }
     persistProjectDraft();
   }
 
@@ -683,7 +987,8 @@
     const task = template.Template;
     const subtitle = [task.MachineName, task.StationId].filter(Boolean).join(' · ');
     $('#taskTemplateDialogTitle').textContent = `${task.DisplayName || task.ClassName} · 模板预览`;
-    $('#taskTemplateDialogSubtitle').textContent = `${task.Namespace}.${task.ClassName} : ${task.BaseType}${subtitle ? `　|　${subtitle}` : ''}`;
+    const baseLabel = task.BaseType ? ` : ${task.BaseType}` : '（无基类）';
+    $('#taskTemplateDialogSubtitle').textContent = `${task.Namespace}.${task.ClassName}${baseLabel}${subtitle ? `　|　${subtitle}` : ''}`;
     const sourceCards = template.Files.map((file, index) => {
       const groupedMethods = new Map();
       file.Methods.forEach(method => {
@@ -715,7 +1020,7 @@
     ];
     $('#taskTemplateDialogBody').innerHTML = `
       <div class="template-summary-grid">
-        <article class="template-summary-card template-summary-primary"><span>Task 类</span><strong>${esc(task.ClassName)}</strong><small>${esc(task.Namespace)} · ${esc(task.BaseType)}</small></article>
+        <article class="template-summary-card template-summary-primary"><span>Task 类</span><strong>${esc(task.ClassName)}</strong><small>${esc(task.Namespace)} · ${esc(task.BaseType || '无基类')}</small></article>
         <article class="template-summary-card"><span>partial 源文件</span><strong>${template.Files.length}</strong><small>主 Task + 工艺文件</small></article>
         <article class="template-summary-card"><span>方法</span><strong>${template.Methods.length}</strong><small>按源码文件分组</small></article>
         <article class="template-summary-card"><span>Task 数据成员</span><strong>${template.TaskData.length}</strong><small>${template.RegionCatalog.length} 个主代码区域</small></article>
@@ -932,6 +1237,8 @@
         if (handle) state.taskOutputDirectories.set(task.TaskId, { native: false, legacyHandle: handle, name: handle.name });
       } catch (_) { /* The project remains usable if the browser clears handle storage. */ }
     }
+    const sharedDirectory = projectTaskOutputDirectory();
+    if (sharedDirectory) setProjectTaskOutputDirectory(sharedDirectory);
     updateWorkspaceHeader();
   }
 
@@ -1096,41 +1403,127 @@
   function generateTaskSources(task, flow, validateEnums = true) {
     const enumWorkbook = state.workspace.EnumWorkbooks?.[0];
     if (enumWorkbook && validateEnums) window.EquipmentFlowEnumWorkbench.makeCSharp(enumWorkbook);
-    return window.EquipmentFlowTaskCodegen.generateSources(task, flow, methodsForTask(task.TaskId),
-      state.workspace.HardwareDefinitions || [], state.workspace.EnumWorkbooks?.[0]?.Namespace || 'ParName', enumBindingResources());
+    const methods = methodsForTask(task.TaskId);
+    const hardware = state.workspace.HardwareDefinitions || [];
+    const enumNamespace = enumWorkbook?.Namespace || 'ParName';
+    const enumResources = enumBindingResources();
+    if (taskUsesInheritedAutoRun(task, flow)) {
+      const methodsSource = window.EquipmentFlowTaskCodegen.generateSingleSource('methods', task, null, methods);
+      const hardwareSource = window.EquipmentFlowTaskCodegen.generateSingleSource('hardware', task, null, methods,
+        hardware, enumNamespace, enumResources);
+      return {
+        taskFileName: `${task.ClassName}.cs`, taskSource: '', includeTaskSource: false,
+        methodsFileName: methodsSource.fileName, methodsSource: methodsSource.source,
+        hardwareFileName: hardwareSource.fileName, hardwareSource: hardwareSource.source,
+        supportFiles: methodsSource.supportFiles || [],
+      };
+    }
+    return window.EquipmentFlowTaskCodegen.generateSources(task, flow, methods,
+      hardware, enumNamespace, enumResources);
   }
 
   function generateTaskSingleSource(task, flow, kind) {
     const enumWorkbook = state.workspace.EnumWorkbooks?.[0];
     if (kind === 'hardware' && enumWorkbook) window.EquipmentFlowEnumWorkbench.makeCSharp(enumWorkbook);
-    return window.EquipmentFlowTaskCodegen.generateSingleSource(kind, task, flow, methodsForTask(task.TaskId),
+    return window.EquipmentFlowTaskCodegen.generateSingleSource(kind, task, flowForTaskGeneration(task, flow), methodsForTask(task.TaskId),
       state.workspace.HardwareDefinitions || [], enumWorkbook?.Namespace || 'ParName',
       kind === 'hardware' ? enumBindingResources() : null);
   }
 
-  // The configured directory is the parent of a TaskName folder, unless it is already that folder.
+  function projectTaskOutputDirectory() {
+    const tasks = state.workspace?.Tasks || [];
+    return state.taskOutputDirectories.get(state.stationId)
+      || tasks.map(task => state.taskOutputDirectories.get(task.TaskId)).find(Boolean)
+      || null;
+  }
+
+  // Every Task in the project writes its generated sources into one selected folder.
+  function setProjectTaskOutputDirectory(directory) {
+    if (!directory) return;
+    for (const task of state.workspace?.Tasks || []) {
+      state.taskOutputDirectories.set(task.TaskId, directory);
+      task.OutputDirectoryPath = directory.native && directory.path ? directory.path : '';
+      task.OutputDirectoryName = directory.name || directory.legacyHandle?.name || '';
+    }
+  }
+
+  // Write directly into the selected folder; never create a TaskName subfolder.
   function taskOutputDirectoryLabel(task, selectedDirectory = state.taskOutputDirectories.get(task.TaskId)) {
     if (!selectedDirectory && task.OutputDirectoryPath) {
       const name = task.OutputDirectoryPath.split(/[\\/]/).filter(Boolean).pop() || task.OutputDirectoryPath;
-      return name.toLowerCase() === task.ClassName.toLowerCase() ? name : name + '\\' + task.ClassName;
+      return name;
     }
     if (!selectedDirectory) return '未配置（生成 .cs 前请选择）';
-    const name = selectedDirectory.name || selectedDirectory.legacyHandle?.name || '';
-    return name.toLowerCase() === task.ClassName.toLowerCase()
-      ? name : name + '\\' + task.ClassName;
+    return selectedDirectory.name || selectedDirectory.legacyHandle?.name || '';
   }
 
   async function taskOutputDirectory(task) {
     const selectedDirectory = state.taskOutputDirectories.get(task.TaskId);
     if (!selectedDirectory)
-      throw new Error('路径配置异常：缺少 Task ' + task.ClassName + ' 的 C# 输出目录。请先在 Task 设置中选择生成目录。');
+      throw new Error('路径配置异常：缺少项目统一 C# 输出目录。请先在 Task 设置中选择一次生成目录。');
     if (!selectedDirectory.native || !selectedDirectory.path)
-      throw new Error('旧项目保存的是浏览器目录权限，无法打开资源管理器。请点击“选择”重新选择 Task 输出目录后再生成。');
+      throw new Error('旧项目保存的是浏览器目录权限，无法打开资源管理器。请点击“选择”重新选择项目统一输出目录后再生成。');
     if (!window.EquipmentFlowTaskCodegen.validIdentifier(task.ClassName))
       throw new Error('Task 类名「' + task.ClassName + '」不是有效的 C# 标识符。');
-    const selectedName = selectedDirectory.name || selectedDirectory.path.split(/[\\/]/).filter(Boolean).pop() || '';
-    if (selectedName.toLowerCase() === task.ClassName.toLowerCase()) return selectedDirectory;
-    return window.EquipmentFlowNativeOutput.createDirectory(selectedDirectory.path, task.ClassName);
+    return selectedDirectory;
+  }
+
+  function splitNativePath(path) {
+    const value = String(path || '').replace(/\//g, '\\').replace(/\\+$/, '');
+    const drive = value.match(/^([A-Za-z]:)(?:\\|$)/);
+    if (drive) return { root: drive[1] + '\\', segments: value.slice(drive[0].length).split('\\').filter(Boolean) };
+    if (value.startsWith('\\\\')) {
+      const parts = value.slice(2).split('\\').filter(Boolean);
+      if (parts.length < 2) return null;
+      return { root: `\\\\${parts[0]}\\${parts[1]}`, segments: parts.slice(2) };
+    }
+    return null;
+  }
+
+  function joinNativePath(root, segments) {
+    if (!segments.length) return root;
+    return root.endsWith('\\') ? root + segments.join('\\') : root + '\\' + segments.join('\\');
+  }
+
+  function parentNativePath(path) {
+    const parts = splitNativePath(path);
+    if (!parts || !parts.segments.length) return null;
+    return joinNativePath(parts.root, parts.segments.slice(0, -1));
+  }
+
+  // Keep shared generated support files beside the Task sources whenever they share an output folder.
+  function commonTaskSupportDirectory(taskDirectories) {
+    const paths = taskDirectories.map(directory => directory && directory.path);
+    if (!paths.length || paths.some(path => !path)) return null;
+    const parsed = paths.map(splitNativePath);
+    if (parsed.some(parts => !parts) || parsed.some(parts => parts.root.toLowerCase() !== parsed[0].root.toLowerCase())) return null;
+    let sharedCount = Math.min(...parsed.map(parts => parts.segments.length));
+    for (let index = 0; index < sharedCount; index += 1) {
+      if (parsed.some(parts => parts.segments[index].toLowerCase() !== parsed[0].segments[index].toLowerCase())) {
+        sharedCount = index;
+        break;
+      }
+    }
+    // A drive or share root is too broad for a project support file.
+    if (sharedCount < 1) return null;
+    const path = joinNativePath(parsed[0].root, parsed[0].segments.slice(0, sharedCount));
+    return { native: true, path, name: path.split('\\').filter(Boolean).pop() || path };
+  }
+
+  async function chooseTaskSupportDirectory(taskDirectories) {
+    const sharedDirectory = commonTaskSupportDirectory(taskDirectories);
+    if (sharedDirectory) return sharedDirectory;
+    const firstParent = parentNativePath(taskDirectories[0]?.path) || taskDirectories[0]?.path || '';
+    const selected = await window.EquipmentFlowNativeOutput.chooseDirectory(firstParent);
+    return selected || null;
+  }
+
+  function supportFilePlans(task, directory, supportFiles) {
+    return (supportFiles || []).map(file => ({
+      kind: 'task-support', label: task ? `${task.ClassName} 共享特性` : '项目共享特性', task, directory,
+      source: file.source, fileName: file.fileName,
+      baseFileNames: [file.fileName], fileNames: [file.fileName],
+    }));
   }
   // Validate the complete deliverable set before saving or generating any source files.
   function collectProjectValidationDiagnostics() {
@@ -1170,13 +1563,23 @@
       else if (seenClassNames.has(className)) add(task, `Task 类名 ${task.ClassName} 重复，生成文件会冲突。`);
       seenClassNames.add(className);
 
+      inheritedMethodsForTask(task).filter(item => item.mustOverride).forEach(item => {
+        add(task, item.local
+          ? `同签名方法 ${item.method.MethodName} 必须声明 override，才能实现 ${item.owner.ClassName} 的 abstract 方法。`
+          : `必须重写父类 ${item.owner.ClassName} 的 abstract 方法 ${item.method.Signature || item.method.MethodName}。`);
+      });
+
       const taskFlows = flows.filter(flow => flow.StationId === task.TaskId);
-      if (taskFlows.length !== 1) {
-        add(task, `必须关联一个 AutoRun 流程，当前找到 ${taskFlows.length} 个。`);
+      const inheritedAutoRun = taskInheritsAutoRun(task);
+      if (taskFlows.length > 1 || (!inheritedAutoRun && taskFlows.length !== 1)) {
+        add(task, inheritedAutoRun
+          ? `最多关联一个 Task 专属流程，当前找到 ${taskFlows.length} 个。`
+          : `必须关联一个 AutoRun 流程，当前找到 ${taskFlows.length} 个。`);
         return;
       }
-      const flow = taskFlows[0];
-      validateTaskFlow(task, flow, diagnostics);
+      const flow = taskFlows[0] || null;
+      const hasOwnFlow = flowHasExecutableNodes(flow);
+      if (hasOwnFlow) validateTaskFlow(task, flow, diagnostics);
       const methodIds = new Set();
       const methodSignatures = new Map();
       methodsForTask(task.TaskId).forEach(method => {
@@ -1250,7 +1653,11 @@
     if (typeof flow.EntryNodeId !== 'string' || !flow.EntryNodeId)
       add('流程入口编号必须是非空文本。');
     const entry = typeof flow.EntryNodeId === 'string' ? nodesById.get(flow.EntryNodeId) : null;
-    if (!entry || entry.NodeType !== 'Start') add('流程入口未指向有效的开始节点。');
+    if (!entry || entry.NodeType !== 'Start') {
+      const entryLabel = entry ? `${entry.NodeId}（${entry.NodeType}）` : String(flow.EntryNodeId || '未设置');
+      const uniqueStartHint = starts.length === 1 ? `；当前开始节点为 ${starts[0].NodeId}` : '';
+      add(`流程入口 ${entryLabel} 未指向有效的开始节点${uniqueStartHint}。`);
+    }
     if (!nodes.some(node => node.NodeType === 'End')) add('流程中没有结束节点。');
 
     const edgeKeys = new Set();
@@ -1273,7 +1680,7 @@
 
     nodes.filter(node => node.NodeType !== 'End' && !outgoing.get(String(node.NodeId))?.length)
       .forEach(node => add(`${node.NodeId}（${node.DisplayName || '未命名节点'}）没有后续连线。`));
-    if (entry) {
+    if (entry && entry.NodeType === 'Start') {
       const reachable = new Set([String(entry.NodeId)]);
       const queue = [String(entry.NodeId)];
       while (queue.length) {
@@ -1362,9 +1769,14 @@
 
   // C# output planning groups Task partial files so conflicts are resolved as one package.
   function makeTaskSourcePlan(task, directory, sources) {
-    const fileNames = [sources.taskFileName, sources.methodsFileName, sources.hardwareFileName];
+    const files = [
+      ...(sources.includeTaskSource === false ? [] : [{ key: 'task', fileName: sources.taskFileName, source: sources.taskSource }]),
+      { key: 'methods', fileName: sources.methodsFileName, source: sources.methodsSource },
+      { key: 'hardware', fileName: sources.hardwareFileName, source: sources.hardwareSource },
+    ];
+    const fileNames = files.map(file => file.fileName);
     return {
-      kind: 'task', label: task.ClassName, task, directory,
+      kind: 'task', label: task.ClassName, task, directory, files,
       baseSources: sources, sources, baseFileNames: fileNames, fileNames,
     };
   }
@@ -1400,11 +1812,7 @@
 
   function outputPlanFiles(plan) {
     if (plan.kind === 'task') {
-      return [
-        { fileName: plan.sources.taskFileName, source: plan.sources.taskSource },
-        { fileName: plan.sources.methodsFileName, source: plan.sources.methodsSource },
-        { fileName: plan.sources.hardwareFileName, source: plan.sources.hardwareSource },
-      ];
+      return plan.files.map((file, index) => ({ fileName: plan.fileNames[index] || file.fileName, source: file.source }));
     }
     return [{ fileName: plan.fileName, source: plan.source }];
   }
@@ -1422,10 +1830,8 @@
       if (!plan.directory?.native || !plan.directory.path)
         throw new Error(`「${plan.label}」缺少本机输出路径，请重新选择 C# 输出目录。`);
       if (plan.kind === 'task') {
-        plan.sources = { ...plan.sources };
-        plan.sources.taskSource = await formatSource(plan.sources.taskFileName, plan.sources.taskSource);
-        plan.sources.methodsSource = await formatSource(plan.sources.methodsFileName, plan.sources.methodsSource);
-        plan.sources.hardwareSource = await formatSource(plan.sources.hardwareFileName, plan.sources.hardwareSource);
+        for (let index = 0; index < plan.files.length; index += 1)
+          plan.files[index].source = await formatSource(plan.fileNames[index], plan.files[index].source);
       } else {
         plan.source = await formatSource(plan.fileName, plan.source);
       }
@@ -1489,9 +1895,7 @@
 
   function applyPlanSuffix(plan, suffix) {
     plan.fileNames = plan.baseFileNames.map(fileName => addFileSuffix(fileName, suffix));
-    if (plan.kind === 'task') {
-      plan.sources = { ...plan.baseSources, taskFileName: plan.fileNames[0], methodsFileName: plan.fileNames[1], hardwareFileName: plan.fileNames[2] };
-    } else {
+    if (plan.kind !== 'task') {
       plan.fileName = plan.fileNames[0];
     }
   }
@@ -1605,7 +2009,7 @@
       await writeFileHandle(handle, plan.source, 'text/plain;charset=utf-8');
       return;
     }
-    if (plan.kind === 'task-file') {
+    if (plan.kind === 'task-file' || plan.kind === 'task-support') {
       if (plan.directory && plan.directory.native) {
         await window.EquipmentFlowNativeOutput.writeText(plan.directory.path, plan.fileName, plan.source);
         return;
@@ -1615,19 +2019,16 @@
       await writeFileHandle(handle, plan.source, 'text/plain;charset=utf-8');
       return;
     }
-    const { sources, directory } = plan;
+    const { directory } = plan;
+    const files = outputPlanFiles(plan);
     if (directory && directory.native) {
-      await window.EquipmentFlowNativeOutput.writeText(directory.path, sources.taskFileName, sources.taskSource);
-      await window.EquipmentFlowNativeOutput.writeText(directory.path, sources.methodsFileName, sources.methodsSource);
-      await window.EquipmentFlowNativeOutput.writeText(directory.path, sources.hardwareFileName, sources.hardwareSource);
+      for (const file of files) await window.EquipmentFlowNativeOutput.writeText(directory.path, file.fileName, file.source);
       return;
     }
-    const taskHandle = await directory.getFileHandle(sources.taskFileName, { create: true });
-    const methodsHandle = await directory.getFileHandle(sources.methodsFileName, { create: true });
-    const hardwareHandle = await directory.getFileHandle(sources.hardwareFileName, { create: true });
-    await writeFileHandle(taskHandle, sources.taskSource, 'text/plain;charset=utf-8');
-    await writeFileHandle(methodsHandle, sources.methodsSource, 'text/plain;charset=utf-8');
-    await writeFileHandle(hardwareHandle, sources.hardwareSource, 'text/plain;charset=utf-8');
+    for (const file of files) {
+      const handle = await directory.getFileHandle(file.fileName, { create: true });
+      await writeFileHandle(handle, file.source, 'text/plain;charset=utf-8');
+    }
   }
 
   // Shared IO is informational: preserve bindings and list every component using the same resource.
@@ -1686,6 +2087,10 @@
     try {
       const flow = currentFlow();
       if (kind === 'flow') {
+        if (taskUsesInheritedAutoRun(task, flow)) {
+          setStatus(`Task ${task.ClassName} 继承父类 AutoRun，无需生成 Task 主文件。`, 'normal');
+          return;
+        }
         if (!flow) throw new Error('当前 Task 缺少流程，无法生成流程.cs。');
         const diagnostics = [];
         validateTaskFlow(task, flow, diagnostics);
@@ -1697,11 +2102,17 @@
       const generated = generateTaskSingleSource(task, flow, kind);
       const directory = await taskOutputDirectory(task);
       const plan = makeTaskSingleSourcePlan(task, directory, kind, generated);
-      if (!(await resolveOutputPlanConflicts([plan]))) return;
-      await formatOutputPlans([plan]);
-      await writeOutputPlan(plan);
+      const plans = [plan];
+      if ((generated.supportFiles || []).length) {
+        const supportDirectory = await chooseTaskSupportDirectory([directory]);
+        if (!supportDirectory) return;
+        plans.push(...supportFilePlans(task, supportDirectory, generated.supportFiles));
+      }
+      if (!(await resolveOutputPlanConflicts(plans))) return;
+      await formatOutputPlans(plans);
+      for (const item of plans) await writeOutputPlan(item);
       setStatus('已生成 ' + plan.fileName + ' 到 ' + taskOutputDirectoryLabel(task), 'normal');
-      showGeneratedOutputSuccess([plan], kind === 'hardware' ? () => showSharedHardwareIoNotice([task]) : null);
+      showGeneratedOutputSuccess(plans, kind === 'hardware' ? () => showSharedHardwareIoNotice([task]) : null);
     } catch (error) {
       if (error && error.name === 'AbortError') return;
       showResult({ Success: false, Message: error.message, Diagnostics: [error.message] }, false);
@@ -1712,7 +2123,7 @@
   async function exportCurrentTaskSources() {
     const task = currentTask();
     const flow = currentFlow();
-    if (!task || !flow) return;
+    if (!task || (!flow && !taskInheritsAutoRun(task))) return;
     try {
       const diagnostics = collectProjectValidationDiagnostics();
       if (diagnostics.length) {
@@ -1722,11 +2133,18 @@
       const sources = generateTaskSources(task, flow);
       const directory = await taskOutputDirectory(task);
       const plan = makeTaskSourcePlan(task, directory, sources);
-      if (!(await resolveOutputPlanConflicts([plan]))) return;
-      await formatOutputPlans([plan]);
-      await writeOutputPlan(plan);
-      setStatus('已生成 Task、方法与硬件分部类到 ' + taskOutputDirectoryLabel(task), 'normal');
-      showGeneratedOutputSuccess([plan], () => showSharedHardwareIoNotice([task]));
+      const plans = [plan];
+      if ((sources.supportFiles || []).length) {
+        const supportDirectory = await chooseTaskSupportDirectory([directory]);
+        if (!supportDirectory) return;
+        plans.push(...supportFilePlans(task, supportDirectory, sources.supportFiles));
+      }
+      if (!(await resolveOutputPlanConflicts(plans))) return;
+      await formatOutputPlans(plans);
+      for (const item of plans) await writeOutputPlan(item);
+      const generatedFileCount = plans.reduce((count, item) => count + outputPlanFiles(item).length, 0);
+      setStatus(`已生成 ${generatedFileCount} 个 C# 文件到 ${taskOutputDirectoryLabel(task)}`, 'normal');
+      showGeneratedOutputSuccess(plans, () => showSharedHardwareIoNotice([task]));
     } catch (error) {
       if (error && error.name === 'AbortError') return;
       showResult({ Success: false, Message: error.message, Diagnostics: [error.message] }, false);
@@ -1735,16 +2153,14 @@
   async function chooseTaskOutputDirectory() {
     const task = currentTask(); if (!task) return;
     const native = window.EquipmentFlowNativeOutput;
-    if (!native?.available) { setStatus('选择 Task 输出目录需要通过本机助手启动 WebEditor。', 'error'); return; }
+    if (!native?.available) { setStatus('选择项目统一 C# 输出目录需要通过本机助手启动 WebEditor。', 'error'); return; }
     try {
-      const directory = await native.chooseDirectory(state.taskOutputDirectories.get(task.TaskId)?.path || '');
+      const directory = await native.chooseDirectory(projectTaskOutputDirectory()?.path || '');
       if (!directory) return;
       directory.native = true;
-      state.taskOutputDirectories.set(task.TaskId, directory);
-      task.OutputDirectoryPath = directory.path;
-      task.OutputDirectoryName = taskOutputDirectoryLabel(task, directory);
+      setProjectTaskOutputDirectory(directory);
       updateWorkspaceHeader(); persistProjectDraft();
-      setStatus('Task ' + task.ClassName + ' 的输出目录已设为 ' + taskOutputDirectoryLabel(task, directory), 'normal');
+      setStatus('项目中所有 Task 的 C# 文件将输出到 ' + taskOutputDirectoryLabel(task, directory), 'normal');
     } catch (error) { if (error.name !== 'AbortError') setStatus(`选择输出目录失败：${error.message}`, 'error'); }
   }
 
@@ -1753,9 +2169,10 @@
     if (!state.workspace || !(state.workspace.Tasks || []).length) return;
     try {
       const tasks = state.workspace.Tasks || [];
-      const tasksWithoutDirectory = tasks.filter(task => !state.taskOutputDirectories.get(task.TaskId));
-      if (tasksWithoutDirectory.length)
-        throw new Error(`路径配置异常：以下 Task 缺少 C# 输出目录：${tasksWithoutDirectory.map(task => task.ClassName).join('、')}。请先分别选择生成目录。`);
+      const sharedDirectory = projectTaskOutputDirectory();
+      if (!sharedDirectory)
+        throw new Error('路径配置异常：缺少项目统一 C# 输出目录。请先在 Task 设置中选择一次生成目录。');
+      setProjectTaskOutputDirectory(sharedDirectory);
       let enumDirectory = await window.EquipmentFlowEnumWorkbench.getCSharpOutputDirectory({
         allowPrompt: false,
         checkPermission: false,
@@ -1770,11 +2187,20 @@
       }
       const enumArtifact = window.EquipmentFlowEnumWorkbench.getCSharpArtifact();
       const plans = [];
+      const taskDirectories = [];
       for (const task of tasks) {
         const flow = state.workspace.Flows.find(item => item.StationId === task.TaskId);
         const sources = generateTaskSources(task, flow, false);
         const directory = await taskOutputDirectory(task);
+        taskDirectories.push(directory);
         plans.push(makeTaskSourcePlan(task, directory, sources));
+      }
+      const supportFiles = plans.flatMap(plan => plan.sources.supportFiles || []);
+      if (supportFiles.length) {
+        const supportDirectory = await chooseTaskSupportDirectory(taskDirectories);
+        if (!supportDirectory) return;
+        // The attribute type is project-wide. Write its single definition once, even when several Tasks use it.
+        plans.push(...supportFilePlans(tasks[0], supportDirectory, [supportFiles[0]]));
       }
       const enumPlan = makeEnumSourcePlan(enumDirectory, enumArtifact);
       if (!(await requestWritePermission(enumDirectory))) throw new Error('没有获得 EnumName.cs 输出目录的写入权限。');
@@ -1788,7 +2214,7 @@
       if (plans.length && !(await resolveOutputPlanConflicts(plans))) return;
       await formatOutputPlans(plans);
       for (const plan of plans) await writeOutputPlan(plan);
-      const totalFiles = tasks.length * 3 + 1;
+      const totalFiles = plans.reduce((count, plan) => count + outputPlanFiles(plan).length, 0);
       setStatus(`已校验并生成 ${totalFiles} 个 C# 文件到设置目录。`, 'normal');
       showGeneratedOutputSuccess(plans, () => showSharedHardwareIoNotice(tasks));
     } catch (error) {
@@ -1831,10 +2257,269 @@
     if (!tasks.length) list.innerHTML = '<div class="empty-inline">新建 Task 或导入 Task 模板</div>';
   }
 
+  function methodModifierSet(method) {
+    const modifiers = new Set([...(method?.Modifiers || []), ...String(method?.MethodModifier || '').split(/\s+/).filter(Boolean)]);
+    if (method?.SourceCode) {
+      try { (parseMethodCodeEditor(method.SourceCode).Modifiers || []).forEach(modifier => modifiers.add(modifier)); }
+      catch (_) { /* Keep metadata already parsed from the source. */ }
+    }
+    return modifiers;
+  }
+
+  function matchesCSharpTypeName(requestedName, candidate) {
+    const requested = String(requestedName || '').trim().replace(/^global::/, '').replace(/\s+/g, '');
+    const fullName = String(candidate?.fullName || candidate?.FullName || '').trim().replace(/^global::/, '').replace(/\s+/g, '');
+    const className = String(candidate?.ClassName || candidate?.name || candidate?.Class || '').trim();
+    if (!requested || !className) return false;
+    return requested === className || requested === fullName;
+  }
+
+  function sourceClassDefinitionsForType(typeName) {
+    const result = [];
+    const seen = new Set();
+    const projectTask = projectTaskForBaseType(typeName);
+    const add = type => {
+      if (!type || type.kind !== 'class' || !matchesCSharpTypeName(typeName, type)) return;
+      const identity = String(type.fullName || `${type.namespace || ''}.${type.name || type.ClassName}`);
+      if (seen.has(identity)) return;
+      seen.add(identity); result.push(type);
+    };
+    (state.workspace?.MethodFiles || []).forEach(file => (file.classes || []).forEach(add));
+    (state.workspace?.Tasks || []).filter(candidate => !projectTask || candidate.TaskId === projectTask.TaskId).forEach(candidate => {
+      const sources = [candidate.PrimarySource, ...(candidate.TemplateFiles || []).map(file => file.Source)];
+      sources.filter(source => typeof source === 'string' && source.trim()).forEach(source => {
+        try {
+          const fileName = `${candidate.ClassName}.cs`;
+          const parsed = window.EquipmentFlowCSharpCatalog.parseSource(source, fileName);
+          const regions = window.EquipmentFlowTaskTemplate.extractRegions(source, fileName);
+          parsed.classes.forEach(type => {
+            (type.methods || []).forEach(method => {
+              const region = regions.filter(item => item.Line <= method.Line && item.EndLine >= method.Line)
+                .sort((left, right) => right.Depth - left.Depth)[0];
+              const explicitCategory = /\bFlowMethodCategory\s*\(|\bFlowMethod\s*\([\s\S]*?\bCategory\s*=/.test(method.AttributeSource || '');
+              if (region && !explicitCategory) method.Category = region.Name;
+            });
+            add(type);
+          });
+        }
+        catch (_) { /* An incomplete imported source must not block the other Task/base definitions. */ }
+      });
+    });
+    return result;
+  }
+
+  function baseTypeDefinition(typeName) {
+    const task = projectTaskForBaseType(typeName);
+    const sourceTypes = sourceClassDefinitionsForType(typeName);
+    const type = sourceTypes[0] || null;
+    const className = task?.ClassName || type?.name || String(typeName || '').split('.').pop();
+    const namespace = task?.Namespace || type?.namespace || '';
+    const methods = [];
+    if (task) methods.push(...(state.workspace?.Methods || []).filter(method => taskOwnsMethod(method, task.TaskId)));
+    (state.workspace?.Methods || []).filter(method => matchesCSharpTypeName(typeName, {
+      name: method.ImportedClassName,
+      fullName: [method.ImportedClassNamespace, method.ImportedClassName].filter(Boolean).join('.'),
+    })).forEach(method => methods.push(method));
+    sourceTypes.forEach(sourceType => methods.push(...(sourceType.methods || [])));
+    const uniqueMethods = new Map();
+    methods.forEach(method => {
+      const signature = csharpMethodSignatureKey(method);
+      if (!uniqueMethods.has(signature)) uniqueMethods.set(signature, method);
+    });
+    const taskBaseType = String(task?.BaseType || '').trim();
+    const taskBaseIsSelf = task && matchesCSharpTypeName(taskBaseType, {
+      name: task.ClassName,
+      fullName: [task.Namespace, task.ClassName].filter(Boolean).join('.'),
+    });
+    return {
+      task,
+      owner: task || { TaskId: '', ClassName: className, Namespace: namespace },
+      BaseType: taskBaseType && !taskBaseIsSelf ? taskBaseType : type?.BaseType || taskBaseType,
+      methods: Array.from(uniqueMethods.values()),
+    };
+  }
+
+  function inheritedMethodsForTask(task) {
+    if (!task?.BaseType || !state.workspace) return [];
+    const visibleBySignature = new Map();
+    const visited = new Set();
+    let baseType = task.BaseType;
+    while (baseType) {
+      const definition = baseTypeDefinition(baseType);
+      const ownerKey = definition.task?.TaskId || `${definition.owner.Namespace || ''}.${definition.owner.ClassName}`;
+      if (!definition.owner.ClassName || visited.has(ownerKey)) break;
+      visited.add(ownerKey);
+      definition.methods.forEach(method => {
+        const signature = csharpMethodSignatureKey(method);
+        if (!visibleBySignature.has(signature)) visibleBySignature.set(signature, { method, owner: definition.owner });
+      });
+      baseType = definition.BaseType;
+    }
+    const ownMethods = (state.workspace.Methods || []).filter(method => taskOwnsMethod(method, task.TaskId));
+    const inherited = Array.from(visibleBySignature.values()).flatMap(({ method, owner }) => {
+      const modifiers = methodModifierSet(method);
+      if (modifiers.has('static') || modifiers.has('sealed') || method.AccessModifier === 'private') return [];
+      if (!['abstract', 'virtual', 'override'].some(modifier => modifiers.has(modifier))) return [];
+      const signature = csharpMethodSignatureKey(method);
+      const local = ownMethods.find(item => csharpMethodSignatureKey(item) === signature);
+      const localIsOverride = Boolean(local && methodModifierSet(local).has('override'));
+      const isAbstract = modifiers.has('abstract');
+      return [{ method, owner, local, signature,
+        localIsOverride,
+        mustOverride: isAbstract && task.ClassModifier !== 'abstract' && !localIsOverride,
+        canDeferOverride: isAbstract && task.ClassModifier === 'abstract' && !localIsOverride,
+      }];
+    });
+    const inheritedSignatures = new Set(inherited.map(item => item.signature));
+    const declaredOverrides = ownMethods.filter(method => methodModifierSet(method).has('override')
+      && !inheritedSignatures.has(csharpMethodSignatureKey(method)));
+    declaredOverrides.forEach(method => {
+      const signature = csharpMethodSignatureKey(method);
+      inherited.push({ method, local: method, localIsOverride: true, signature,
+        owner: { ClassName: String(task.BaseType || '').split('.').pop(), Namespace: '' },
+        mustOverride: false, canDeferOverride: false, sourceUnresolved: true });
+    });
+    return inherited;
+  }
+
+  function addInheritedMethodOverride(item) {
+    const task = currentTask();
+    if (!task || !item?.method || !item.owner) return;
+    if (item.local) { openMethodDialog(item.local); return; }
+    const duplicate = (state.workspace.Methods || []).find(method => taskOwnsMethod(method, task.TaskId)
+      && csharpMethodSignatureKey(method) === item.signature);
+    if (duplicate) { openMethodDialog(duplicate); return; }
+    const inherited = item.method;
+    const parameters = (inherited.Parameters || []).map(parameter => ({ ...parameter }));
+    const sourceModifiers = methodModifierSet(inherited);
+    const isAbstract = sourceModifiers.has('abstract');
+    const args = parameters.map(parameter => `${['in', 'ref', 'out'].includes(parameter.Direction) ? `${parameter.Direction} ` : ''}${parameter.Name}`);
+    const baseCall = `base.${inherited.MethodName}(${args.join(', ')})`;
+    const bodyText = isAbstract
+      ? `throw new global::System.NotImplementedException(${JSON.stringify(`请实现 ${inherited.MethodName}`)});`
+      : inherited.ReturnType === 'void' ? `${baseCall};` : `return ${baseCall};`;
+    let methodId = inherited.MethodId || `${task.ClassName}.${item.signature}`;
+    if ((state.workspace.Methods || []).some(method => taskOwnsMethod(method, task.TaskId) && method.MethodId === methodId))
+      methodId = `${task.ClassName}.${item.signature}.override`;
+    const method = rewriteCopiedMethodMetadata(cloneTaskJson(inherited), item.owner.TaskId, task.TaskId, methodId);
+    Object.assign(method, {
+      TaskId: task.TaskId,
+      MethodModifier: 'override',
+      Modifiers: ['override'],
+      Parameters: parameters,
+      ParameterModelVersion: 2,
+      BodyText: bodyText,
+      PreserveSource: false,
+      ImportedFileName: `${task.ClassName}_Methods.cs`,
+      ImportedClassName: task.ClassName,
+      ImportedClassNamespace: task.Namespace,
+    });
+    method.SourceCode = window.EquipmentFlowTaskCodegen.methodSource(method);
+    method.PreserveSource = true;
+    method.AttributeSource = method.AttributeSource || '';
+    method.CanBind = Boolean(inherited.CanBind && method.MethodId);
+    if (!method.CanBind) method.ContractIssue = inherited.ContractIssue || '该继承方法没有可用于流程绑定的元数据。';
+    method.Category = method.Category || currentTaskMethodCategories(task)[0]?.Name || 'Common';
+    state.workspace.Methods.push(method);
+    addTaskMethodCategory(task, method.Category);
+    renderAll(); updateWorkspaceHeader(); persistProjectDraft();
+    setStatus(`已在 ${task.ClassName}_Methods.cs 生成 ${method.MethodModifier} ${method.MethodName}。`, 'normal');
+    openMethodDialog(method);
+  }
+
+  function restoreMethodLibrarySectionState(section, storageKey) {
+    try { section.open = localStorage.getItem(storageKey) !== 'false'; }
+    catch (_) { section.open = true; }
+    section.addEventListener('toggle', () => {
+      try { localStorage.setItem(storageKey, String(section.open)); }
+      catch (_) { /* Collapsed state is a convenience and may be unavailable in private browsing. */ }
+    });
+  }
+
+  function renderInheritedMethods(list, items, options = {}) {
+    const section = document.createElement('details');
+    section.className = 'inherited-method-library method-library-section';
+    const storageKey = `botech.task-editor.inherited-methods-open.${options.taskId || currentTask()?.TaskId || ''}`;
+    restoreMethodLibrarySectionState(section, storageKey);
+    section.innerHTML = `<summary class="inherited-method-heading method-library-section-toggle"><strong>父类继承</strong><span>${items.length} 个</span></summary>`;
+    if (!items.length) {
+      const empty = document.createElement('div');
+      empty.className = 'inherited-method-empty';
+      empty.textContent = options.hasActiveFilters
+        ? '没有符合当前搜索、修饰符或 Region 筛选条件的父类方法'
+        : options.hasCandidates
+          ? '当前父类没有 abstract/virtual/override 方法'
+          : `没有读取到 ${options.baseType || '父类'} 的可重写方法定义；请确认其 Task 或 C# 源码已导入项目`;
+      section.appendChild(empty);
+      list.appendChild(section);
+      return;
+    }
+    items.forEach(item => {
+      const method = item.local || item.method;
+      const card = document.createElement('article');
+      card.className = 'inherited-method-card';
+      const badge = item.localIsOverride ? '已重写' : item.local ? '同签名未重写' : item.mustOverride ? '必须重写' : item.canDeferOverride ? '可延后重写' : '可重写';
+      const badgeClass = item.local && !item.localIsOverride ? 'conflict' : item.mustOverride ? 'required' : 'optional';
+      const modifiers = [...methodModifierSet(method)].join(' ') || '无修饰符';
+      const returnType = method.ReturnType || 'void';
+      const outputs = (method.Parameters || []).filter(parameter => ['out', 'ref'].includes(parameter.Direction));
+      const outcomes = returnType === 'bool' ? 'true / false'
+        : returnType === 'int' ? (method.ResultStatusCodes || []).join(' / ') || '状态码未配置'
+          : '顺序执行';
+      card.innerHTML = `<div class="inherited-method-card-heading"><strong>${esc(method.MethodName || method.MethodId)}</strong><span class="inherited-method-state inherited-method-state-${badgeClass}">${esc(badge)}</span></div>
+        <span class="method-tags">
+          <span class="method-tag">${esc(method.AccessModifier || 'private')}</span>
+          <span class="method-return-shape ${returnType === 'bool' ? 'return-bool' : returnType === 'int' ? 'return-int' : 'return-void'}">${esc(returnType)}</span>
+          <span class="method-tag">${esc(modifiers)}</span>
+          <span class="method-tag method-tag-category">${esc(method.Category || '未分类')}</span>
+        </span>
+        <small>${esc(item.owner.ClassName)} · ${esc(method.Signature || method.MethodName)}</small>
+        ${method.DocumentationSummary ? `<p>${esc(method.DocumentationSummary)}</p>` : ''}
+        <small>${esc(outcomes)}</small>
+        ${outputs.length ? `<small>out ${esc(outputs.map(parameter => `${parameter.Name}: ${parameter.TypeName}`).join(' · '))}</small>` : ''}`;
+      if (item.local && item.localIsOverride && item.local.CanBind !== false) {
+        card.draggable = true;
+        card.title = '此方法已满足父类 override 契约；拖到画布可创建流程节点。';
+        card.addEventListener('dragstart', event => {
+          event.dataTransfer.effectAllowed = 'copy';
+          event.dataTransfer.setData('application/x-equipment-flow-method', JSON.stringify({
+            MethodId: item.local.MethodId, SchemaVersion: item.local.SchemaVersion, TaskId: item.local.TaskId,
+          }));
+        });
+      }
+      const action = document.createElement('button');
+      action.type = 'button'; action.className = 'catalog-action';
+      action.textContent = item.local ? (item.localIsOverride ? '编辑 override' : '编辑同名方法') : '编辑 override';
+      if (!item.local) action.title = '尚未重写时会先生成当前 Task 的 override，再打开编辑器';
+      action.addEventListener('click', () => addInheritedMethodOverride(item));
+      card.appendChild(action); section.appendChild(card);
+    });
+    list.appendChild(section);
+  }
+
+  function renderTaskVariableSummary(task = currentTask()) {
+    const host = $('#taskVariableSummary');
+    if (!host) return;
+    if (!task) {
+      host.classList.add('hidden');
+      host.innerHTML = '';
+      return;
+    }
+    const variables = Array.isArray(task.MethodVariables) ? task.MethodVariables : [];
+    const fallbackRegion = currentTaskMethodCategories(task)[0]?.Name || 'Common';
+    host.classList.remove('hidden');
+    host.innerHTML = `<div class="task-variable-summary-heading"><strong>Task 变量</strong><span>${variables.length} 项</span></div>
+      ${variables.length ? `<div class="task-variable-summary-list">${variables.map(variable => `<button type="button" class="task-variable-summary-item" data-open-task-variables title="编辑 Task 变量定义">
+        <strong>${esc(variable.Name || '未命名变量')}</strong><code>${esc(variable.Type || 'bool')}</code><span>${String(variable.MemberKind || 'field').toLowerCase() === 'property' ? '属性' : '字段'}</span><small>${esc(variable.RegionName || fallbackRegion)}</small>
+      </button>`).join('')}</div>` : '<div class="task-variable-summary-empty">尚未添加变量；变量定义与函数同级，生成在函数外。</div>'}`;
+    host.querySelectorAll('[data-open-task-variables]').forEach(button => button.addEventListener('click', openTaskVariablesDialog));
+  }
+
   function renderMethods() {
     const list = $('#methodList');
     const task = currentTask();
     const regionFilter = $('#methodRegionFilter');
+    renderTaskVariableSummary(task);
     if (!state.workspace || !task) {
       selectedMethodIds.clear(); methodSelectionAnchor = '';
       regionFilter.innerHTML = '<option value="">全部 Region</option>';
@@ -1843,11 +2528,16 @@
       return;
     }
     regionFilter.disabled = false;
-    const taskMethods = (state.workspace.Methods || []).filter(method => method.TaskId === task.TaskId);
+    const taskMethods = (state.workspace.Methods || []).filter(method => taskOwnsMethod(method, task.TaskId));
+    const inheritedCandidates = inheritedMethodsForTask(task);
     const previousRegion = regionFilter.value;
     const regionNames = [...new Set([
       ...(task.MethodCategories || []).map(category => typeof category === 'string' ? category : category && (category.Name || category.RegionName)),
-      ...taskMethods.map(method => String(method.Category || '').trim() || '未分类')
+      ...taskMethods.map(method => String(method.Category || '').trim() || '未分类'),
+        ...inheritedCandidates.flatMap(item => [
+          String(item.local?.Category || '').trim() || '未分类',
+          String(item.method.Category || '').trim() || '未分类',
+        ])
     ].map(region => String(region || '').trim()).filter(Boolean))];
     regionFilter.innerHTML = '<option value="">全部 Region</option>'
       + regionNames.map(region => `<option value="${esc(region)}">${esc(region)}</option>`).join('');
@@ -1857,23 +2547,28 @@
     const modifierFilter = $('#methodModifierFilter').value;
     const selectedRegion = regionFilter.value;
     const query = ($('#methodSearch').value || '').trim().toLowerCase();
-    const methods = taskMethods.filter(method => {
+    const matchesMethodFilters = (method, extraText = '', checkRegion = true) => {
       const matchesQuery = !query || [method.MethodName, method.MethodId, method.Category, method.Signature,
-        method.ReturnType, ...(method.Parameters || []).map(item => item.TypeName)].join(' ').toLowerCase().includes(query);
+        method.ReturnType, extraText, ...(method.Parameters || []).map(item => item.TypeName)].join(' ').toLowerCase().includes(query);
       if (!matchesQuery) return false;
-      if (selectedRegion && (String(method.Category || '').trim() || '未分类') !== selectedRegion) return false;
+      if (checkRegion && selectedRegion && (String(method.Category || '').trim() || '未分类') !== selectedRegion) return false;
       if (!modifierFilter) return true;
-      const modifiers = new Set([...(method.Modifiers || []), ...String(method.MethodModifier || '').split(/\s+/).filter(Boolean)]);
-      if (method.SourceCode) {
-        try { (parseMethodCodeEditor(method.SourceCode).Modifiers || []).forEach(modifier => modifiers.add(modifier)); }
-        catch (_) { /* Retain modifiers already stored for older or partial source entries. */ }
-      }
+      const modifiers = methodModifierSet(method);
       return modifierFilter === 'none' ? modifiers.size === 0 : modifiers.has(modifierFilter);
+    };
+    const methods = taskMethods.filter(method => matchesMethodFilters(method));
+    const inheritedMethods = inheritedCandidates.filter(item => {
+      const method = item.local || item.method;
+      const baseMethod = item.method;
+      const regionMatches = !selectedRegion || [method.Category, baseMethod.Category]
+        .some(category => (String(category || '').trim() || '未分类') === selectedRegion);
+      const searchText = [item.owner.ClassName, baseMethod.MethodName, baseMethod.MethodId,
+        baseMethod.Signature, baseMethod.Category, baseMethod.ReturnType,
+        ...(baseMethod.Parameters || []).map(parameter => parameter.TypeName)].join(' ');
+      return regionMatches && matchesMethodFilters(method, searchText, false);
     });
-    if (!methods.length) {
-      list.innerHTML = taskMethods.length
-        ? '<div class="empty-inline">没有符合搜索、修饰符或 Region 筛选的方法。</div>'
-        : '<div class="empty-inline">当前 Task 还没有方法。<br>点击“新增函数”或导入 Task partial .cs 文件。</div>';
+    if (!methods.length && !inheritedMethods.length && !taskMethods.length && !inheritedCandidates.length && !task.BaseType) {
+      list.innerHTML = '<div class="empty-inline">当前 Task 还没有方法。<br>点击“新增函数”或导入 Task partial .cs 文件。</div>';
       return;
     }
     const files = new Map();
@@ -1885,6 +2580,16 @@
       if (!classes.has(className)) classes.set(className, []);
       classes.get(className).push(method);
     });
+    if (!files.size && (taskMethods.length || inheritedCandidates.length || task.BaseType))
+      files.set(`${task.ClassName}_Methods.cs`, new Map([[task.ClassName, []]]));
+    const parentMethodSet = new Set(inheritedCandidates.map(item => item.local).filter(Boolean));
+    inheritedCandidates.filter(item => item.localIsOverride).forEach(item => parentMethodSet.add(item.local));
+    selectedMethodIds.forEach(methodId => {
+      if (Array.from(parentMethodSet).some(method => method.MethodId === methodId)) selectedMethodIds.delete(methodId);
+    });
+    const classNames = Array.from(files.values()).flatMap(classes => Array.from(classes.keys()));
+    const parentMethodClassName = classNames.includes(task.ClassName) ? task.ClassName : classNames[0] || task.ClassName;
+    let parentSectionRendered = false;
     list.innerHTML = '';
     files.forEach((classes, fileName) => {
       const fileTree = document.createElement('details');
@@ -1903,7 +2608,28 @@
         const classTree = document.createElement('details'); classTree.className = 'catalog-class-tree'; classTree.open = true;
         classTree.innerHTML = `<summary><span class="tree-class-icon">C</span><span class="tree-summary-copy"><strong>${esc(className)}</strong><small>${esc(task.Namespace || 'BoTech')} partial</small></span></summary>`;
         const methodRoot = document.createElement('div'); methodRoot.className = 'catalog-tree-children catalog-method-list';
-        items.forEach(method => {
+        if (!parentSectionRendered && className === parentMethodClassName) {
+          renderInheritedMethods(methodRoot, inheritedMethods, {
+            hasCandidates: inheritedCandidates.length > 0,
+            hasActiveFilters: Boolean(query || selectedRegion || modifierFilter),
+            baseType: task.BaseType,
+            taskId: task.TaskId,
+          });
+          parentSectionRendered = true;
+        }
+        const privateMethods = items.filter(method => !parentMethodSet.has(method));
+        const privateSection = document.createElement('details');
+        privateSection.className = 'private-method-library method-library-section';
+        const privateStorageKey = `botech.task-editor.private-methods-open.${task.TaskId}.${fileName}.${className}`;
+        restoreMethodLibrarySectionState(privateSection, privateStorageKey);
+        privateSection.innerHTML = `<summary class="inherited-method-heading private-method-heading method-library-section-toggle"><strong>私有方法</strong><span>${privateMethods.length} 个</span></summary>`;
+        if (!privateMethods.length) {
+          const empty = document.createElement('div');
+          empty.className = 'private-method-empty';
+          empty.textContent = '没有符合当前筛选条件的私有方法';
+          privateSection.appendChild(empty);
+        }
+        privateMethods.forEach(method => {
           const button = document.createElement('button');
           button.type = 'button'; button.className = `method-card catalog-method-card${selectedMethodIds.has(method.MethodId) ? ' method-selected' : ''}`; button.draggable = true;
           button.dataset.methodId = method.MethodId;
@@ -1970,8 +2696,9 @@
               MethodId: method.MethodId, SchemaVersion: method.SchemaVersion, TaskId: method.TaskId,
             }));
           });
-          methodRoot.appendChild(button);
+          privateSection.appendChild(button);
         });
+        methodRoot.appendChild(privateSection);
         classTree.appendChild(methodRoot); children.appendChild(classTree);
       });
       fileTree.appendChild(children); list.appendChild(fileTree);
@@ -2368,17 +3095,29 @@
   function renderFlow() {
     const flow = currentFlow();
     const task = currentTask();
+    const inheritedAutoRunOnly = taskUsesInheritedAutoRun(task, flow);
+    const canvasEmpty = $('#canvasEmpty');
+    const flowCanvas = $('#flowCanvas');
     if (flow) {
       loadLayout(flow);
       $('#flowTitle').textContent = task ? task.Name : flow.StationId;
-      $('#flowMeta').textContent = `${task ? `${task.Namespace}.${task.ClassName}` : flow.FlowId} · ${flow.Nodes.length} 个节点 · 入口 ${flow.EntryNodeId || '未设置'}`;
+      $('#flowMeta').textContent = `${task ? `${task.Namespace}.${task.ClassName}` : flow.FlowId} · ${inheritedAutoRunOnly ? '继承父类 AutoRun' : `${flow.Nodes.length} 个节点 · 入口 ${flow.EntryNodeId || '未设置'}`}`;
     } else {
       $('#flowTitle').textContent = '未选择 Task';
-      $('#flowMeta').textContent = '新建 Task 后绘制 AutoRun 流程';
+      $('#flowMeta').textContent = task && inheritedAutoRunOnly ? '继承父类 AutoRun' : '新建 Task 后绘制 AutoRun 流程';
     }
-    $('#canvasEmpty').classList.toggle('hidden', Boolean(flow && flow.Nodes.length));
-    $('#nodeMetric').textContent = `${flow ? flow.Nodes.length : 0} 个节点`;
-    $('#edgeMetric').textContent = `${flow ? flow.Transitions.length : 0} 条分支`;
+    if (canvasEmpty) {
+      canvasEmpty.classList.toggle('hidden', !inheritedAutoRunOnly && Boolean(flow && flow.Nodes.length));
+      const title = canvasEmpty.querySelector('strong');
+      const detail = canvasEmpty.querySelector('small');
+      if (title) title.textContent = inheritedAutoRunOnly ? '此 Task 继承父类 AutoRun' : '在这里绘制工站流程';
+      if (detail) detail.textContent = inheritedAutoRunOnly
+        ? `运行流程由 ${task?.BaseType || '父类'} 提供；拖入流程节点后可单独定义当前 Task 的流程`
+        : '从顶部拖入形状，或从左侧拖入方法';
+    }
+    flowCanvas?.classList.toggle('inherited-auto-empty', inheritedAutoRunOnly);
+    $('#nodeMetric').textContent = `${inheritedAutoRunOnly ? 0 : flow ? flow.Nodes.length : 0} 个节点`;
+    $('#edgeMetric').textContent = `${inheritedAutoRunOnly ? 0 : flow ? flow.Transitions.length : 0} 条分支`;
     canvasEditor.render();
     renderInspector();
   }
@@ -2710,6 +3449,8 @@
     } else {
       node[field] = value;
     }
+    window.EquipmentFlowCanvas.synchronizeEntryNode(flow,
+      field === 'NodeType' && value === 'Start' ? node.NodeId : '');
     saveLayout(flow);
     if (redraw) { canvasEditor.render(); return; }
     renderFlow();
@@ -2880,7 +3621,8 @@
     const names = { Start: '开始', End: '结束', Action: '运行步骤', Condition: '条件判断', Wait: '等待条件', Alarm: '报警处理' };
     flow.Nodes.push({ NodeId: nodeId, NodeType: type, DisplayName: names[type] || type, MethodId: '',
       MethodSchemaVersion: 0, PendingStatusCode: null, TimeoutMilliseconds: null, FailurePolicy: 'Fault', Parameters: [] });
-    if (type === 'Start' && !flow.EntryNodeId) flow.EntryNodeId = nodeId;
+    const hasValidEntry = flow.Nodes.some(node => node.NodeType === 'Start' && node.NodeId === flow.EntryNodeId);
+    window.EquipmentFlowCanvas.synchronizeEntryNode(flow, type === 'Start' && !hasValidEntry ? nodeId : '');
     state.layout[nodeId] = insertionPoint(point);
     state.selectedNodeId = nodeId;
     state.activeInspector = 'node';
@@ -4132,18 +4874,334 @@
   function createNewTask() {
     $('#newTaskName').value = '';
     state.pendingTaskTemplate = null;
+    state.pendingTaskCopySourceId = '';
     $('#taskDialogTitle').textContent = '新建 Task';
+    $('#createTaskButton').textContent = '创建 Task';
     openDialog('taskDialog');
     setTimeout(() => $('#newTaskName').focus(), 0);
   }
 
+  function cloneTaskJson(value) {
+    return value == null ? value : JSON.parse(JSON.stringify(value));
+  }
+
+  function taskOwnsMethod(method, taskId) {
+    return method && (method.TaskId === taskId || (!method.TaskId && method.StationId === taskId));
+  }
+
+  function taskCopyCounts(taskId) {
+    const flow = state.workspace.Flows.find(item => item.StationId === taskId);
+    return {
+      methods: (state.workspace.Methods || []).filter(method => taskOwnsMethod(method, taskId)).length,
+      nodes: (flow?.Nodes || []).length,
+      transitions: (flow?.Transitions || []).length,
+      hardware: (state.workspace.HardwareDefinitions || []).filter(item => item.TaskId === taskId).length,
+    };
+  }
+
+  function copyTaskSuggestedName(task) {
+    const base = `${task.ClassName}_Copy`;
+    let candidate = base;
+    let index = 2;
+    while (state.workspace.Tasks.some(item => item.ClassName.toLowerCase() === candidate.toLowerCase()))
+      candidate = `${base}${index++}`;
+    return candidate;
+  }
+
+  function copyTaskAsNew() {
+    const source = currentTask();
+    if (!source) return;
+    state.pendingTaskTemplate = null;
+    state.pendingTaskCopySourceId = source.TaskId;
+    $('#taskDialogTitle').textContent = `复制 ${source.ClassName} 为新 Task`;
+    $('#createTaskButton').textContent = '创建副本';
+    $('#newTaskName').value = copyTaskSuggestedName(source);
+    openDialog('taskDialog');
+    setTimeout(() => $('#newTaskName').focus(), 0);
+  }
+
+  function updateCopyTaskTargetSummary() {
+    const dialog = $('#copyTaskTargetDialog');
+    const source = state.workspace.Tasks.find(item => item.TaskId === dialog.dataset.sourceTaskId);
+    const target = state.workspace.Tasks.find(item => item.TaskId === $('#copyTaskTargetSelect').value);
+    const summary = $('#copyTaskTargetSummary');
+    if (!source || !target) { summary.textContent = '请选择一个不同于来源的目标 Task。'; return; }
+    const sourceCounts = taskCopyCounts(source.TaskId);
+    const targetCounts = taskCopyCounts(target.TaskId);
+    summary.textContent = `来源 ${source.ClassName}：${sourceCounts.methods} 个方法、${sourceCounts.nodes} 个流程节点、${sourceCounts.hardware} 个硬件类\n目标 ${target.ClassName} 当前：${targetCounts.methods} 个方法、${targetCounts.nodes} 个流程节点、${targetCounts.hardware} 个硬件类`;
+  }
+
+  function openCopyTaskIntoExisting() {
+    const source = currentTask();
+    if (!source) return;
+    const targets = state.workspace.Tasks.filter(task => task.TaskId !== source.TaskId);
+    if (!targets.length) { setStatus('当前工程只有一个 Task，请先新建一个目标 Task。', 'error'); return; }
+    $('#copyTaskTargetDialog').dataset.sourceTaskId = source.TaskId;
+    $('#copyTaskTargetSource').textContent = `来源：${source.ClassName}`;
+    $('#copyTaskTargetSelect').innerHTML = targets.map(task =>
+      `<option value="${esc(task.TaskId)}">${esc(task.ClassName)}</option>`).join('');
+    updateCopyTaskTargetSummary();
+    openDialog('copyTaskTargetDialog');
+  }
+
+  function escapeRegExp(value) {
+    return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  function replaceTaskIdentifier(source, oldName, newName) {
+    const text = String(source || '');
+    if (!oldName || oldName === newName) return text;
+    const identifier = new RegExp(`(^|[^\\p{L}\\p{N}_])${escapeRegExp(oldName)}(?=$|[^\\p{L}\\p{N}_])`, 'gu');
+    return text.replace(identifier, (_match, prefix) => prefix + newName);
+  }
+
+  function replaceTaskNamespace(source, oldNamespace, newNamespace) {
+    const text = String(source || '');
+    if (!oldNamespace || oldNamespace === newNamespace) return text;
+    const declaration = new RegExp(`(\\bnamespace\\s+)${escapeRegExp(oldNamespace)}(?=\\s*[;{])`, 'g');
+    return text.replace(declaration, (_match, prefix) => prefix + newNamespace);
+  }
+
+  function renameTaskFileName(fileName, oldName, newName) {
+    const value = String(fileName || '');
+    if (!oldName || oldName === newName) return value;
+    const separator = Math.max(value.lastIndexOf('/'), value.lastIndexOf('\\'));
+    const prefix = value.slice(0, separator + 1);
+    const leaf = value.slice(separator + 1);
+    const matcher = new RegExp(`^${escapeRegExp(oldName)}(?=\\.|_)`, 'i');
+    return prefix + leaf.replace(matcher, newName);
+  }
+
+  function csharpStringLiteralValue(literal) {
+    try {
+      if (literal.startsWith('@"')) return literal.slice(2, -1).replace(/""/g, '"');
+      return JSON.parse(literal);
+    } catch (_) { return literal.slice(1, -1); }
+  }
+
+  function rewriteCopiedMethodMetadata(method, sourceTaskId, destinationTaskId, destinationMethodId) {
+    const rewrite = value => String(value || '')
+      .replace(/(\[\s*(?:[\w.]+\s*\.\s*)?(?:FlowMethod|FlowMethodId)\s*\(\s*)"(?:\\.|[^"\\])*"/g,
+        (_match, prefix) => prefix + JSON.stringify(destinationMethodId))
+      .replace(/(\bStationId\s*=\s*)(@?"(?:\\.|[^"\\])*"|@"(?:[^"]|"")*")/g,
+        (match, prefix, literal) => csharpStringLiteralValue(literal) === sourceTaskId
+          ? prefix + JSON.stringify(destinationTaskId) : match);
+    const previousAttributes = String(method.AttributeSource || '');
+    const nextAttributes = rewrite(previousAttributes);
+    method.AttributeSource = nextAttributes;
+    if (typeof method.SourceCode === 'string' && method.SourceCode) {
+      const attributeIndex = previousAttributes ? method.SourceCode.indexOf(previousAttributes) : -1;
+      method.SourceCode = attributeIndex >= 0
+        ? method.SourceCode.slice(0, attributeIndex) + nextAttributes + method.SourceCode.slice(attributeIndex + previousAttributes.length)
+        : rewrite(method.SourceCode);
+    }
+    method.MethodId = destinationMethodId;
+    if (method.StationId === sourceTaskId) method.StationId = destinationTaskId;
+    method.TaskId = destinationTaskId;
+    return method;
+  }
+
+  function validateCopiedTaskConfiguration(sourceTask, targetTask, destinationNamespace) {
+    const targetClassName = targetTask.ClassName;
+    const selfNames = new Set([targetClassName, `${destinationNamespace || 'BoTech'}.${targetClassName}`]);
+    if (selfNames.has(String(sourceTask.BaseType || '').trim()))
+      throw new Error(`无法复制：来源 Task 的继承类型会让目标 ${targetClassName} 继承自身。`);
+    const baseTask = projectTaskForBaseType(sourceTask.BaseType);
+    if (baseTask && (baseTask.TaskId === targetTask.TaskId || taskBaseChainContains(baseTask, targetTask.TaskId)))
+      throw new Error(`无法复制：来源 Task 的继承关系会让 ${targetClassName} 形成循环继承。`);
+    if (sourceTask.ClassModifier === 'sealed') {
+      const descendants = new Set([targetTask.TaskId]);
+      let changed = true;
+      while (changed) {
+        changed = false;
+        (state.workspace.Tasks || []).forEach(task => {
+          const parent = projectTaskForBaseType(task.BaseType);
+          if (parent && descendants.has(parent.TaskId) && !descendants.has(task.TaskId)) {
+            descendants.add(task.TaskId);
+            changed = true;
+          }
+        });
+      }
+      const child = (state.workspace.Tasks || []).find(task => task.TaskId !== targetTask.TaskId && descendants.has(task.TaskId));
+      if (child) throw new Error(`无法复制：${child.ClassName} 继承目标 Task，不能将目标改为 sealed。`);
+    }
+  }
+
+  function createCopiedTaskId(className) {
+    let taskId = '';
+    do { taskId = `${className}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`; }
+    while (state.workspace.Tasks.some(task => task.TaskId === taskId));
+    return taskId;
+  }
+
+  function copyTaskContents(sourceTask, targetTask, isNewTask = false) {
+    if (!sourceTask || !targetTask || sourceTask.TaskId === targetTask.TaskId)
+      throw new Error('请选择一个与来源不同的目标 Task。');
+    if (isNewTask && !window.EquipmentFlowTaskCodegen.validIdentifier(targetTask.ClassName))
+      throw new Error('新 Task 名称必须是有效的 C# 类名。');
+    if (isNewTask && state.workspace.Tasks.some(task => task.ClassName.toLowerCase() === targetTask.ClassName.toLowerCase()))
+      throw new Error(`Task 类名 ${targetTask.ClassName} 已存在。`);
+    const destinationNamespace = isNewTask ? sourceTask.Namespace : targetTask.Namespace;
+    validateCopiedTaskConfiguration(sourceTask, targetTask, destinationNamespace);
+
+    const sourceFlow = state.workspace.Flows.find(flow => flow.StationId === sourceTask.TaskId) || null;
+    const previousTargetFlow = state.workspace.Flows.find(flow => flow.StationId === targetTask.TaskId) || null;
+    if (sourceFlow && sourceTask.TaskId === state.stationId) saveLayout(sourceFlow);
+    const sourceLayout = cloneTaskJson((state.workspace.CanvasLayouts || {})[sourceTask.TaskId]
+      || (sourceTask.TaskId === state.stationId ? state.layout : {})) || {};
+    const oldClassName = sourceTask.ClassName;
+    const newClassName = targetTask.ClassName;
+    const destinationTaskId = targetTask.TaskId;
+    const previousMethodRecords = (state.workspace.Methods || []).filter(method => taskOwnsMethod(method, sourceTask.TaskId));
+    const methodIdMap = new Map();
+    const usedMethodIds = new Set();
+    const copiedMethods = previousMethodRecords.map(sourceMethod => {
+      const method = cloneTaskJson(sourceMethod);
+      const previousId = String(method.MethodId || '');
+      let methodId = previousId ? `${newClassName}.${csharpMethodSignatureKey(method)}` : '';
+      if (methodId) {
+        const base = methodId;
+        let suffix = 2;
+        while (usedMethodIds.has(methodId)) methodId = `${base}.${suffix++}`;
+        usedMethodIds.add(methodId);
+        if (!methodIdMap.has(previousId)) methodIdMap.set(previousId, methodId);
+      }
+      rewriteCopiedMethodMetadata(method, sourceTask.TaskId, destinationTaskId, methodId);
+      method.ImportedFileName = renameTaskFileName(method.ImportedFileName || `${oldClassName}_Methods.cs`, oldClassName, newClassName);
+      if (!method.ImportedClassName || method.ImportedClassName === oldClassName) method.ImportedClassName = newClassName;
+      if (!method.ImportedClassNamespace || method.ImportedClassNamespace === sourceTask.Namespace) method.ImportedClassNamespace = destinationNamespace;
+      return method;
+    });
+
+    const copiedTask = cloneTaskJson(sourceTask);
+    const outputDirectory = isNewTask
+      ? (state.taskOutputDirectories.get(sourceTask.TaskId) || projectTaskOutputDirectory())
+      : (state.taskOutputDirectories.get(targetTask.TaskId) || projectTaskOutputDirectory());
+    const outputPath = outputDirectory?.native && outputDirectory.path
+      ? outputDirectory.path
+      : (isNewTask ? '' : String(targetTask.OutputDirectoryPath || ''));
+    const outputName = outputDirectory?.name || outputDirectory?.legacyHandle?.name
+      || (isNewTask ? '' : String(targetTask.OutputDirectoryName || ''));
+    Object.assign(copiedTask, {
+      TaskId: destinationTaskId,
+      ClassName: newClassName,
+      Name: isNewTask ? newClassName : (targetTask.Name || targetTask.ClassName),
+      Namespace: destinationNamespace || 'BoTech',
+      OutputDirectoryPath: outputPath,
+      OutputDirectoryName: outputName,
+    });
+    const templatePathMap = new Map();
+    copiedTask.TemplateFiles = (copiedTask.TemplateFiles || []).map(file => {
+      const nextPath = renameTaskFileName(file.Path, oldClassName, newClassName);
+      if (file.Path) templatePathMap.set(file.Path, nextPath);
+      return { ...file, Path: nextPath,
+        Source: replaceTaskNamespace(replaceTaskIdentifier(file.Source, oldClassName, newClassName), sourceTask.Namespace, copiedTask.Namespace) };
+    });
+    copiedTask.TemplatePrimaryPath = templatePathMap.get(copiedTask.TemplatePrimaryPath)
+      || renameTaskFileName(copiedTask.TemplatePrimaryPath, oldClassName, newClassName);
+    copiedTask.PrimarySource = replaceTaskNamespace(replaceTaskIdentifier(copiedTask.PrimarySource, oldClassName, newClassName), sourceTask.Namespace, copiedTask.Namespace);
+
+    let copiedFlow = null;
+    if (sourceFlow) {
+      copiedFlow = cloneTaskJson(sourceFlow);
+      copiedFlow.FlowId = `${newClassName}_AutoRun`;
+      copiedFlow.StationId = destinationTaskId;
+      copiedFlow.TaskName = newClassName;
+      copiedFlow.Nodes = (copiedFlow.Nodes || []).map(node => {
+        const copy = { ...node };
+        if (copy.MethodId) {
+          const sourceMethodIndex = previousMethodRecords.findIndex(method => method.MethodId === copy.MethodId
+            && (copy.MethodSchemaVersion == null || Number(method.SchemaVersion) === Number(copy.MethodSchemaVersion))
+            && (copy.MethodMachineName == null || String(method.MachineName || '') === String(copy.MethodMachineName || ''))
+            && (copy.MethodStationId == null || !copy.MethodStationId || method.StationId === copy.MethodStationId || method.StationId === sourceTask.TaskId));
+          if (sourceMethodIndex >= 0 && copiedMethods[sourceMethodIndex]?.MethodId)
+            copy.MethodId = copiedMethods[sourceMethodIndex].MethodId;
+        }
+        if (copy.MethodStationId === sourceTask.TaskId) copy.MethodStationId = destinationTaskId;
+        return copy;
+      });
+      copiedFlow.Transitions = (copiedFlow.Transitions || []).map(edge => ({ ...edge }));
+    } else if (isNewTask) {
+      copiedFlow = createTaskFlow(copiedTask);
+    }
+
+    const copiedHardware = (state.workspace.HardwareDefinitions || [])
+      .filter(item => item.TaskId === sourceTask.TaskId)
+      .map(item => ({ ...cloneTaskJson(item), HardwareId: `hardware_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`, TaskId: destinationTaskId }));
+    const copiedMethodFiles = (state.workspace.MethodFiles || [])
+      .filter(file => file.taskId === sourceTask.TaskId)
+      .map(file => {
+        const copy = cloneTaskJson(file);
+        copy.taskId = destinationTaskId;
+        copy.fileName = renameTaskFileName(copy.fileName, oldClassName, newClassName);
+        copy.classes = (copy.classes || []).map(type => {
+          const clonedType = cloneTaskJson(type);
+          if (clonedType.name === oldClassName) {
+            clonedType.name = newClassName;
+            if (clonedType.namespace === sourceTask.Namespace) clonedType.namespace = copiedTask.Namespace;
+            clonedType.fullName = `${clonedType.namespace || copiedTask.Namespace}.${newClassName}`;
+          }
+          clonedType.methods = (clonedType.methods || []).map(method => ({
+            ...method,
+            MethodId: methodIdMap.get(method.MethodId) || method.MethodId,
+            StationId: method.StationId === sourceTask.TaskId ? destinationTaskId : method.StationId,
+          }));
+          return clonedType;
+        });
+        return copy;
+      });
+
+    if (previousTargetFlow) {
+      clearFlowDrafts(state.invalidFields, state.invalidDrafts, previousTargetFlow);
+      try { localStorage.removeItem(`botech.task.layout.${targetTask.TaskId}.${previousTargetFlow.FlowId}`); } catch (_) { /* Layout cache is optional. */ }
+    }
+    const replaceBy = (items, predicate, replacement) => {
+      const index = items.findIndex(predicate);
+      if (index >= 0) items[index] = replacement;
+      else items.push(replacement);
+    };
+    replaceBy(state.workspace.Tasks, task => task.TaskId === destinationTaskId, copiedTask);
+    replaceBy(state.workspace.Stations, station => station.StationId === destinationTaskId,
+      { StationId: destinationTaskId, DisplayName: copiedTask.Name });
+    state.workspace.Methods = (state.workspace.Methods || []).filter(method => !taskOwnsMethod(method, destinationTaskId)).concat(copiedMethods);
+    state.workspace.MethodFiles = (state.workspace.MethodFiles || []).filter(file => file.taskId !== destinationTaskId).concat(copiedMethodFiles);
+    state.workspace.HardwareDefinitions = (state.workspace.HardwareDefinitions || []).filter(item => item.TaskId !== destinationTaskId).concat(copiedHardware);
+    state.workspace.Flows = (state.workspace.Flows || []).filter(flow => flow.StationId !== destinationTaskId);
+    if (copiedFlow) state.workspace.Flows.push(copiedFlow);
+    state.workspace.CanvasLayouts = state.workspace.CanvasLayouts || {};
+    if (copiedFlow) {
+      state.workspace.CanvasLayouts[destinationTaskId] = sourceLayout;
+      try { localStorage.setItem(`botech.task.layout.${destinationTaskId}.${copiedFlow.FlowId}`, JSON.stringify(sourceLayout)); } catch (_) { /* Layout cache is optional. */ }
+    } else delete state.workspace.CanvasLayouts[destinationTaskId];
+    state.workspace.DataBindings = collectDataBindings();
+
+    if (outputDirectory) state.taskOutputDirectories.set(destinationTaskId, outputDirectory);
+    state.stationId = destinationTaskId;
+    state.selectedNodeId = copiedFlow?.EntryNodeId || null;
+    state.layout = sourceLayout;
+    selectedMethodIds.clear();
+    methodSelectionAnchor = '';
+    canvasEditor.reset(); renderAll(); updateWorkspaceHeader();
+    persistProjectDraft();
+    setStatus(isNewTask
+      ? `已将 ${sourceTask.ClassName} 的配置、方法、流程和硬件复制为 ${copiedTask.ClassName}。`
+      : `已将 ${sourceTask.ClassName} 的配置、方法、流程和硬件复制到 ${copiedTask.ClassName}。`, 'normal');
+    return copiedTask;
+  }
+
   function addTaskModel(name, template = null) {
     const task = window.EquipmentFlowTaskCodegen.createBlankTask(name);
+    const outputDirectory = projectTaskOutputDirectory();
+    if (outputDirectory) {
+      task.OutputDirectoryPath = outputDirectory.native && outputDirectory.path ? outputDirectory.path : '';
+      task.OutputDirectoryName = outputDirectory.name || outputDirectory.legacyHandle?.name || '';
+    }
     if (state.workspace.Tasks.some(item => item.ClassName.toLowerCase() === task.ClassName.toLowerCase()))
       throw new Error(`Task 类名 ${task.ClassName} 已存在。`);
     if (template) {
       task.Namespace = template.Template.Namespace;
-      task.BaseType = template.Template.BaseType;
+      task.BaseType = String(template.Template.BaseType || '').trim();
+      task.SourceBaseType = task.BaseType;
       task.CreatedFromTemplate = true;
       task.TemplateFileName = template.FileName;
       task.TemplatePrimaryPath = template.PrimarySource;
@@ -4187,8 +5245,9 @@
       });
       state.workspace.Methods.push(...templateMethods);
     }
-    const flow = window.EquipmentFlowTaskCodegen.defaultFlow(task);
+    const flow = createTaskFlow(task);
     state.workspace.Tasks.push(task);
+    if (outputDirectory) state.taskOutputDirectories.set(task.TaskId, outputDirectory);
     state.workspace.Stations.push({ StationId: task.TaskId, DisplayName: task.Name });
     state.workspace.Flows.push(flow);
     state.stationId = task.TaskId;
@@ -4240,8 +5299,10 @@
     const template = state.workspace && state.workspace.TaskTemplate;
     if (!template) return;
     state.pendingTaskTemplate = template;
+    state.pendingTaskCopySourceId = '';
     $('#newTaskName').value = template.Template.ClassName || '';
     $('#taskDialogTitle').textContent = '按模板新建 Task';
+    $('#createTaskButton').textContent = '创建 Task';
     closeTaskTemplateDialog();
     openDialog('taskDialog');
     setTimeout(() => $('#newTaskName').focus(), 0);
@@ -4495,6 +5556,153 @@
     requestAnimationFrame(() => { if (methodCodeEditor) { methodCodeEditor.paint(); methodCodeEditor.layout(); methodCodeEditor.focus(); } });
   }
 
+  function renderMethodCustomVariables() {
+    const list = $('#methodCustomVariableRows');
+    if (!list) return;
+    const task = currentTask();
+    const categories = currentTaskMethodCategories(task);
+    const categoryOptions = categories.map(category => `<option value="${esc(category.Name)}">${esc(category.Name)}</option>`).join('');
+    const typeOptions = ['bool', 'int', 'string', 'long', 'float', 'double', 'decimal'];
+    list.innerHTML = methodCustomVariables.map(variable => `<article class="method-custom-variable-row" data-method-custom-variable="${esc(variable.VariableId)}">
+      <div class="method-custom-variable-fields">
+        <label>名称<input type="text" data-method-variable-name value="${esc(variable.Name)}" placeholder="例如 IsReady" maxlength="80"></label>
+        <label>类型<select data-method-variable-type>${typeOptions.map(type => `<option value="${type}" ${variable.Type === type ? 'selected' : ''}>${type}</option>`).join('')}</select></label>
+        <label>Region<select data-method-variable-region>${categoryOptions}</select></label>
+        <label>形式<select data-method-variable-kind><option value="field" ${variable.MemberKind === 'field' ? 'selected' : ''}>字段</option><option value="property" ${variable.MemberKind === 'property' ? 'selected' : ''}>属性</option></select></label>
+        <label>初始值<span class="method-variable-initial"><input type="checkbox" data-method-variable-has-initial ${variable.HasInitialValue ? 'checked' : ''} title="指定初始值"><input type="text" data-method-variable-initial value="${esc(variable.InitializerSource || variable.InitialValue || '')}" ${variable.HasInitialValue ? '' : 'disabled'} placeholder="可选"></span></label>
+      </div>
+      <button type="button" class="catalog-action" data-remove-method-variable title="删除变量">×</button>
+    </article>`).join('');
+    list.querySelectorAll('[data-method-custom-variable]').forEach(row => {
+      const variable = methodCustomVariables.find(item => item.VariableId === row.dataset.methodCustomVariable);
+      if (!variable) return;
+      row.querySelector('[data-method-variable-name]').addEventListener('input', event => { variable.Name = event.target.value.trim(); });
+      row.querySelector('[data-method-variable-type]').addEventListener('change', event => { variable.Type = event.target.value; });
+      row.querySelector('[data-method-variable-region]').value = variable.RegionName;
+      row.querySelector('[data-method-variable-region]').addEventListener('change', event => { variable.RegionName = event.target.value; });
+      row.querySelector('[data-method-variable-kind]').addEventListener('change', event => { variable.MemberKind = event.target.value; });
+      row.querySelector('[data-method-variable-has-initial]').addEventListener('change', event => {
+        variable.HasInitialValue = event.target.checked;
+        row.querySelector('[data-method-variable-initial]').disabled = !variable.HasInitialValue;
+      });
+      row.querySelector('[data-method-variable-initial]').addEventListener('input', event => {
+        variable.InitialValue = event.target.value;
+        variable.InitializerSource = '';
+      });
+      row.querySelector('[data-remove-method-variable]').addEventListener('click', () => {
+        methodCustomVariables = methodCustomVariables.filter(item => item !== variable);
+        renderMethodCustomVariables();
+      });
+    });
+  }
+
+  function addTaskVariable() {
+    const task = currentTask();
+    if (!task) return;
+    const categories = currentTaskMethodCategories(task);
+    const preferredRegion = $('#methodRegionFilter').value;
+    let name = 'Variable1';
+    for (let index = 2; methodCustomVariables.some(variable => variable.Name.toLowerCase() === name.toLowerCase()); index++)
+      name = 'Variable' + index;
+    methodCustomVariables.push({
+      VariableId: `task_variable_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`,
+      Name: name, Type: 'bool', MemberKind: 'field', HasInitialValue: false, InitialValue: '',
+      InitializerSource: '', AccessModifier: 'public', Modifiers: [],
+      RegionName: categories.some(category => category.Name === preferredRegion) ? preferredRegion : categories[0]?.Name || 'Common',
+    });
+    renderMethodCustomVariables();
+  }
+
+  function taskVariablesSnapshot() {
+    return JSON.stringify(methodCustomVariables);
+  }
+
+  function openTaskVariablesDialog() {
+    const task = currentTask();
+    if (!task) { setStatus('请先新建 Task。', 'warning'); return; }
+    methodCustomVariables = JSON.parse(JSON.stringify(Array.isArray(task.MethodVariables) ? task.MethodVariables : []));
+    const availableRegions = currentTaskMethodCategories(task).map(category => category.Name);
+    const fallbackRegion = availableRegions[0] || 'Common';
+    methodCustomVariables.forEach((variable, index) => {
+      variable.VariableId ||= `task_variable_saved_${index}`;
+      variable.Type ||= 'bool';
+      variable.MemberKind ||= 'field';
+      variable.HasInitialValue = Boolean(variable.HasInitialValue || variable.InitializerSource);
+      variable.AccessModifier ||= 'public';
+      variable.Modifiers ||= [];
+      if (!availableRegions.includes(variable.RegionName)) variable.RegionName = fallbackRegion;
+    });
+    $('#taskVariablesDialogError').classList.add('hidden');
+    $('#taskVariablesDialogError').textContent = '';
+    renderMethodCustomVariables();
+    openDialog('taskVariablesDialog');
+    taskVariablesDialogBaseline = taskVariablesSnapshot();
+  }
+
+  function requestTaskVariablesDialogClose(force = false) {
+    const dialog = $('#taskVariablesDialog');
+    if (!dialog.open) return;
+    if (!force && taskVariablesDialogBaseline && taskVariablesSnapshot() !== taskVariablesDialogBaseline
+      && !window.confirm('Task 变量有未保存的修改，确定放弃吗？')) return;
+    closeDialog('taskVariablesDialog');
+    taskVariablesDialogBaseline = '';
+  }
+
+  function taskVariablesDialogError(message) {
+    const element = $('#taskVariablesDialogError');
+    element.textContent = message;
+    element.classList.remove('hidden');
+  }
+
+  function saveTaskVariablesFromDialog(event) {
+    event.preventDefault();
+    const task = currentTask();
+    if (!task) return;
+    const categories = currentTaskMethodCategories(task).map(item => item.Name);
+    const variables = methodCustomVariables.map(variable => ({
+      ...variable,
+      Name: String(variable.Name || '').trim(),
+      Type: String(variable.Type || '').trim().toLowerCase(),
+      RegionName: String(variable.RegionName || '').trim(),
+      MemberKind: String(variable.MemberKind || 'field').trim().toLowerCase(),
+    }));
+    const memberNames = new Set(['autorun', task.ClassName.toLowerCase()]);
+    (state.workspace.Methods || []).filter(method => taskOwnsMethod(method, task.TaskId)).forEach(method => {
+      memberNames.add(String(method.MethodName || '').toLowerCase());
+    });
+    for (const variable of variables) {
+      if (!window.EquipmentFlowTaskCodegen.validIdentifier(variable.Name)) {
+        taskVariablesDialogError('变量名称必须是有效的 C# 标识符。'); return;
+      }
+      if (memberNames.has(variable.Name.toLowerCase())) {
+        taskVariablesDialogError(`变量 ${variable.Name} 与当前 Task 的其他成员或方法重名。`); return;
+      }
+      memberNames.add(variable.Name.toLowerCase());
+      if (!['bool', 'int', 'string', 'long', 'float', 'double', 'decimal'].includes(variable.Type)) {
+        taskVariablesDialogError(`变量 ${variable.Name} 的类型不受支持。`); return;
+      }
+      if (!['field', 'property'].includes(variable.MemberKind)) {
+        taskVariablesDialogError(`变量 ${variable.Name} 的形式无效。`); return;
+      }
+      if (!categories.includes(variable.RegionName)) {
+        taskVariablesDialogError(`变量 ${variable.Name} 需要选择有效的 Region。`); return;
+      }
+    }
+    try {
+      const methods = (state.workspace.Methods || []).filter(method => taskOwnsMethod(method, task.TaskId));
+      window.EquipmentFlowTaskCodegen.generateSingleSource('methods', { ...task, MethodVariables: variables }, null, methods);
+    } catch (error) {
+      taskVariablesDialogError(error.message || String(error)); return;
+    }
+    task.MethodVariables = variables;
+    renderAll();
+    updateWorkspaceHeader();
+    persistProjectDraft();
+    closeDialog('taskVariablesDialog');
+    taskVariablesDialogBaseline = '';
+    setStatus(`已保存 ${variables.length} 项 Task 变量定义；字段和属性与函数处于同一级别。`, 'normal');
+  }
+
   function methodDialogSnapshot() {
     const parameters = Array.from($('#methodParameterRows').querySelectorAll('.method-parameter-row')).map(row => ({
       Name: row.querySelector('.method-parameter-name').value,
@@ -4590,9 +5798,25 @@
     const categories = currentTaskMethodCategories(task);
     list.innerHTML = categories.map((category, index) => {
       const count = (state.workspace.Methods || []).filter(method => method.TaskId === task.TaskId && method.Category === category.Name).length;
-      return `<div class="method-region-row" data-region-index="${index}"><input class="method-region-name" value="${esc(category.Name)}" aria-label="Region 名稱"><span class="method-region-count">${count} 个方法${category.Name === 'Common' ? ' · 默认' : ''}</span><button class="catalog-action method-region-save" type="button">保存名称</button><button class="catalog-action method-region-delete" type="button" title="删除后该 Region 的方法移入 Common">删除</button></div>`;
+      return `<div class="method-region-row" data-region-index="${index}"><input class="method-region-name" value="${esc(category.Name)}" aria-label="Region 名稱"><span class="method-region-count">${count} 个方法${index === 0 ? ' · 默认' : ''}</span><div class="method-region-actions"><div class="method-region-order" aria-label="调整 ${esc(category.Name)} 排序"><button class="catalog-action method-region-move" data-region-move="up" type="button" aria-label="${esc(category.Name)} 上移" title="上移" ${index === 0 ? 'disabled' : ''}>↑</button><button class="catalog-action method-region-move" data-region-move="down" type="button" aria-label="${esc(category.Name)} 下移" title="下移" ${index === categories.length - 1 ? 'disabled' : ''}>↓</button></div><button class="catalog-action method-region-save" type="button">保存名称</button><button class="catalog-action method-region-delete" type="button" title="删除后该 Region 的方法移入默认 Region">删除</button></div></div>`;
     }).join('') || '<div class="empty-inline">当前 Task 尚无 Region。可从模板或方法 .cs 的 #region 导入。</div>';
     refreshMethodCategorySelect($('#methodCategoryInput').value);
+    list.querySelectorAll('.method-region-move').forEach(button => button.addEventListener('click', () => {
+      const row = button.closest('[data-region-index]');
+      const category = categories[Number(row.dataset.regionIndex)];
+      if (!category) return;
+      const movable = categories.slice();
+      const index = movable.indexOf(category);
+      const nextIndex = index + (button.dataset.regionMove === 'up' ? -1 : 1);
+      if (nextIndex < 0 || nextIndex >= movable.length) return;
+      [movable[index], movable[nextIndex]] = [movable[nextIndex], movable[index]];
+      movable.forEach((item, order) => { item.Order = order; });
+      const selectedRegion = $('#methodCategoryInput').value;
+      syncTaskMethodCategories(task);
+      refreshMethodCategorySelect(selectedRegion);
+      renderMethodRegions(); renderMethods(); persistProjectDraft();
+      setStatus(`Region「${category.Name}」已${button.dataset.regionMove === 'up' ? '上移' : '下移'}。`, 'normal');
+    }));
     list.querySelectorAll('.method-region-save').forEach(button => button.addEventListener('click', () => {
       const row = button.closest('[data-region-index]'), category = categories[Number(row.dataset.regionIndex)];
       const name = row.querySelector('.method-region-name').value.trim();
@@ -4600,20 +5824,34 @@
       if (categories.some(item => item !== category && item.Name.toLowerCase() === name.toLowerCase())) { setStatus(`Region ${name} 已存在。`, 'error'); return; }
       const oldName = category.Name;
       category.Name = name; category.RegionName = name;
-      state.workspace.Methods.filter(method => method.TaskId === task.TaskId && method.Category === oldName).forEach(method => { method.Category = name; });
+      state.workspace.Methods.filter(method => method.TaskId === task.TaskId).forEach(method => {
+        if (String(method.Category || '').trim().toLowerCase() === oldName.toLowerCase()) method.Category = name;
+      });
+      (task.MethodVariables || []).forEach(variable => {
+        if (String(variable.RegionName || '').trim().toLowerCase() === oldName.toLowerCase()) variable.RegionName = name;
+      });
+      if ($('#methodRegionFilter').value === oldName) $('#methodRegionFilter').value = name;
       syncTaskMethodCategories(task);
       refreshMethodCategorySelect(name); renderMethodRegions(); renderMethods(); persistProjectDraft();
       setStatus(`方法库 Region 已更新为 ${name}。枚举 Region 保持独立。`, 'normal');
     }));
     list.querySelectorAll('.method-region-delete').forEach(button => button.addEventListener('click', () => {
       const row = button.closest('[data-region-index]'), category = categories[Number(row.dataset.regionIndex)];
+      const removedName = category.Name;
       task.MethodCategories = categories.filter(item => item !== category);
-      if (category.Name === 'Common') task.MethodCategories.push({ Name: 'Common', RegionName: 'Common', Order: 0 });
-      (state.workspace.Methods || []).filter(method => method.TaskId === task.TaskId && method.Category === category.Name)
-        .forEach(method => { method.Category = 'Common'; });
+      if (!task.MethodCategories.length) task.MethodCategories.push({ Name: 'Common', RegionName: 'Common', Order: 0 });
+      task.MethodCategories.forEach((item, index) => { item.Order = index; });
+      const fallbackRegion = currentTaskMethodCategories(task)[0]?.Name || 'Common';
+      (state.workspace.Methods || []).filter(method => method.TaskId === task.TaskId).forEach(method => {
+        if (String(method.Category || '').trim().toLowerCase() === removedName.toLowerCase()) method.Category = fallbackRegion;
+      });
+      (task.MethodVariables || []).forEach(variable => {
+        if (String(variable.RegionName || '').trim().toLowerCase() === removedName.toLowerCase()) variable.RegionName = fallbackRegion;
+      });
+      if ($('#methodRegionFilter').value === removedName) $('#methodRegionFilter').value = fallbackRegion;
       syncTaskMethodCategories(task);
-      refreshMethodCategorySelect(); renderMethodRegions(); persistProjectDraft();
-      setStatus('已删除 Region ' + category.Name + '；其中的方法已移入 Common。', 'normal');
+      refreshMethodCategorySelect(); renderMethodRegions(); renderMethods(); persistProjectDraft();
+      setStatus(`已删除 Region ${removedName}；所属方法和变量已移入 ${fallbackRegion}。`, 'normal');
     }));
   }
 
@@ -4622,7 +5860,7 @@
     const input = $('#newMethodRegionNameInput'), name = input.value.trim();
     if (!name || /[\r\n]|#(?:end)?region/i.test(name)) { setStatus('Region 名称不能为空，也不能包含换行或 #region 指令。', 'error'); return; }
     if (!addTaskMethodCategory(task, name)) { setStatus(`方法库 Region ${name} 已存在或名称无效。`, 'error'); return; }
-    input.value = ''; renderMethodRegions();
+    input.value = ''; renderMethodRegions(); renderMethods();
     refreshMethodCategorySelect(name);
     persistProjectDraft(); setStatus(`已添加方法库 Region：${name}`, 'normal');
   }
@@ -4653,13 +5891,15 @@
   function saveMethodFromDialog(event) {
     event.preventDefault();
     const task = currentTask();
-    const flow = currentFlow();
-    if (!task || !flow) return;
+    if (!task) return;
     const name = $('#methodNameInput').value.trim();
     const returnType = methodReturnTypeFromForm();
     const methodModifier = $('#methodModifierInput').value || '';
     const category = $('#methodCategoryInput').value.trim();
     if (!window.EquipmentFlowTaskCodegen.validIdentifier(name)) { methodDialogError('方法名必须是有效的 C# 标识符，不能使用关键字。'); return; }
+    if ((task.MethodVariables || []).some(variable => String(variable.Name || '').toLowerCase() === name.toLowerCase())) {
+      methodDialogError(`函数名 ${name} 与 Task 变量重名，请修改其中一个名称。`); return;
+    }
     if (!returnType || !/^(?:[\p{L}_][\p{L}\p{N}_]*(?:\s*<[^\r\n]+>)?(?:\[\])?\??|void)$/u.test(returnType)) { methodDialogError('返回类型格式不正确，请选择类型或填写自定义类型。'); return; }
     const hasAbstractTaskPartial = (state.workspace.MethodFiles || []).some(file => file.taskId === task.TaskId
       && (file.classes || []).some(classType => classType.name === task.ClassName
@@ -4775,6 +6015,7 @@
       Signature: `${returnType} ${name}(${parameters.map(parameter => `${parameter.IsParams ? 'params ' : ''}${['in', 'ref', 'out'].includes(parameter.Direction) ? `${parameter.Direction} ` : ''}${parameter.TypeName} ${parameter.Name}${parameter.DefaultValue ? ` = ${parameter.DefaultValue}` : ''}`).join(', ')})`,
       ImportedFileName: `${task.ClassName}_Methods.cs`, ImportedClassName: task.ClassName,
     });
+    delete method.CustomVariables;
     if (!state.editingMethod) state.workspace.Methods.push(method);
     addTaskMethodCategory(task, category);
     state.workspace.Flows.filter(item => item.StationId === task.TaskId).forEach(taskFlow => taskFlow.Nodes.forEach(node => {
@@ -4902,6 +6143,13 @@
       state.workspace.Flows[index] = snapshot.flow;
       state.layout = snapshot.layout; state.invalidFields.clear(); state.invalidDrafts.clear();
     },
+    onNodeDoubleClick: node => {
+      const method = methodFor(node);
+      if (!method) return false;
+      setWorkspaceView('flow');
+      openMethodDialog(method);
+      return true;
+    },
     selectionChanged: () => { updateInspectorTab(); renderInspector(); },
     addShape: addControlNode, status: setStatus,
   });
@@ -4993,19 +6241,54 @@
   $('#taskAccessModifierSelect').addEventListener('change', event => saveTaskClassSetting('AccessModifier', event.target.value));
   $('#newTaskButton').addEventListener('click', createNewTask);
   $('#newTaskMenuButton').addEventListener('click', createNewTask);
+  $('#copyTaskAsNewButton').addEventListener('click', copyTaskAsNew);
+  $('#copyTaskIntoExistingButton').addEventListener('click', openCopyTaskIntoExisting);
   $('#deleteTaskButton').addEventListener('click', deleteCurrentTask);
+  $('#copyTaskTargetSelect').addEventListener('change', updateCopyTaskTargetSummary);
+  $('#copyTaskTargetForm').addEventListener('submit', event => {
+    event.preventDefault();
+    const source = state.workspace.Tasks.find(task => task.TaskId === $('#copyTaskTargetDialog').dataset.sourceTaskId);
+    const target = state.workspace.Tasks.find(task => task.TaskId === $('#copyTaskTargetSelect').value);
+    if (!source || !target || source.TaskId === target.TaskId) {
+      setStatus('来源或目标 Task 已变化，请重新选择。', 'error');
+      closeDialog('copyTaskTargetDialog');
+      return;
+    }
+    const counts = taskCopyCounts(source.TaskId);
+    if (!window.confirm(`将 ${counts.methods} 个方法、${counts.nodes} 个流程节点和 ${counts.hardware} 个硬件类复制到 ${target.ClassName}，并替换目标对应内容。目标命名空间、类名、Task ID 和输出目录会保留。此操作不能自动撤销，是否继续？`)) return;
+    try {
+      copyTaskContents(source, target, false);
+      closeDialog('copyTaskTargetDialog');
+    } catch (error) {
+      setStatus(error.message, 'error');
+    }
+  });
   $('#taskForm').addEventListener('submit', event => {
     event.preventDefault();
     try {
-      addTaskModel($('#newTaskName').value.trim(), state.pendingTaskTemplate);
+      const copySource = state.workspace.Tasks.find(task => task.TaskId === state.pendingTaskCopySourceId);
+      if (copySource) {
+        const className = $('#newTaskName').value.trim();
+        const copiedTask = window.EquipmentFlowTaskCodegen.createBlankTask(className);
+        copiedTask.TaskId = createCopiedTaskId(className);
+        copyTaskContents(copySource, copiedTask, true);
+        closeDialog('taskDialog');
+      } else addTaskModel($('#newTaskName').value.trim(), state.pendingTaskTemplate);
       state.pendingTaskTemplate = null;
+      state.pendingTaskCopySourceId = '';
     }
     catch (error) { setStatus(error.message, 'error'); $('#newTaskName').setCustomValidity(error.message); $('#newTaskName').reportValidity(); }
   });
-  $('#taskDialog').addEventListener('close', () => { state.pendingTaskTemplate = null; });
+  $('#taskDialog').addEventListener('close', () => {
+    state.pendingTaskTemplate = null;
+    state.pendingTaskCopySourceId = '';
+    $('#createTaskButton').textContent = '创建 Task';
+    $('#taskDialogTitle').textContent = '新建 Task';
+  });
   $('#newTaskName').addEventListener('input', event => event.target.setCustomValidity(''));
   $$('[data-close-dialog]').forEach(button => button.addEventListener('click', () => {
     if (button.dataset.closeDialog === 'methodDialog') requestMethodDialogClose();
+    else if (button.dataset.closeDialog === 'taskVariablesDialog') requestTaskVariablesDialogClose();
     else closeDialog(button.dataset.closeDialog);
   }));
   $('#generatedFileSuccessFolders').addEventListener('click', async event => {
@@ -5047,6 +6330,7 @@
     finally { button.disabled = false; }
   });
   $('#newMethodButton').addEventListener('click', () => openMethodDialog());
+  $('#manageTaskVariablesButton').addEventListener('click', openTaskVariablesDialog);
   $('#methodForm').addEventListener('submit', saveMethodFromDialog);
   $('#methodQuickSaveButton').addEventListener('click', () => saveMethodFromDialog({ preventDefault() {} }));
   $('#methodDialog').addEventListener('cancel', event => { event.preventDefault(); requestMethodDialogClose(); });
@@ -5063,6 +6347,10 @@
     closeDialog('methodClosePrompt');
     saveMethodFromDialog({ preventDefault() {} });
   });
+  $('#taskVariablesForm').addEventListener('submit', saveTaskVariablesFromDialog);
+  $('#addTaskVariableButton').addEventListener('click', addTaskVariable);
+  $('#taskVariablesDialog').addEventListener('cancel', event => { event.preventDefault(); requestTaskVariablesDialogClose(); });
+  $('#taskVariablesDialog').addEventListener('close', () => { taskVariablesDialogBaseline = ''; });
   $('#addParameterButton').addEventListener('click', () => addMethodParameterRow());
   $('#generateMethodTemplateButton').addEventListener('click', generateMethodBodyTemplate);
   $('#methodReturnTypeInput').addEventListener('change', () => {
@@ -5330,4 +6618,3 @@
   });
   setStatus(state.workspace.Tasks.length ? '已恢复 Task 项目，可继续编辑' : '新建 Task 或导入 Task 模板开始编辑', 'normal');
 })();
-

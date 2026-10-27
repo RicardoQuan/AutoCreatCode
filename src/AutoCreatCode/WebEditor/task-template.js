@@ -68,9 +68,12 @@
     if (Number(manifest.Version) !== VERSION) throw new Error(`暂不支持 Task 模板版本 ${manifest.Version}。`);
 
     const task = manifest.Template || {};
-    ['ClassName', 'Namespace', 'BaseType'].forEach(key => {
+    ['ClassName', 'Namespace'].forEach(key => {
       if (typeof task[key] !== 'string' || !task[key].trim()) throw new Error(`模板清单缺少 Template.${key}。`);
     });
+    if (task.BaseType == null) task.BaseType = 'TaskBase_MoverStation';
+    if (typeof task.BaseType !== 'string') throw new Error('模板清单 Template.BaseType 必须是文本；留空表示不继承基类。');
+    task.BaseType = task.BaseType.trim();
     if (!Array.isArray(manifest.SourceFiles) || !manifest.SourceFiles.length) throw new Error('模板清单没有 SourceFiles。');
     const sourceDescriptors = manifest.SourceFiles.map(descriptor => ({
       ...descriptor,
@@ -104,8 +107,8 @@
       const declaration = new RegExp(`\\bclass\\s+${escapeRegExp(task.ClassName)}\\b([^\\{;]*)`).exec(source);
       if (!declaration) throw new Error(`${descriptor.Path} 中的 ${task.ClassName} 类声明无法读取。`);
       if (descriptor.Path === primarySource) {
-        const baseType = String(task.BaseType).split('.').pop();
-        if (!new RegExp(`:\\s*(?:[\\w.]+\\.)?${escapeRegExp(baseType)}\\b`).test(declaration[1]))
+        const baseType = String(task.BaseType || '').split('.').pop();
+        if (baseType && !new RegExp(`:\\s*(?:[\\w.]+\\.)?${escapeRegExp(baseType)}\\b`).test(declaration[1]))
           throw new Error(`主 Task 源码的基类与清单声明的“${task.BaseType}”不一致。`);
       }
       const regions = extractRegions(source, descriptor.Path);

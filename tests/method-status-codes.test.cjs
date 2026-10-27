@@ -43,4 +43,3 @@ test('allows removing an unused status and ignores wildcard transitions', () => 
     Transitions: [{ FromNodeId: 'N3', Outcome: '*', ToNodeId: 'end' }] }] };
   assert.deepEqual(statuses.validateResultStatusCodesChange(method, [1], workspace), [0, 1]);
 });
-

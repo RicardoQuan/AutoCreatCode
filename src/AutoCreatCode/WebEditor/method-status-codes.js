@@ -60,4 +60,3 @@
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   if (typeof window !== 'undefined') window.EquipmentFlowMethodStatuses = api;
 })();
-

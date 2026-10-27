@@ -275,4 +275,3 @@ Confirm each canonical target exists and its current hash matches the staged bas
 - Existing transitions and route geometry are explicitly preserved in Task 4.
 - In an isolated Edge page, adding status `4` from the second bound node updated the method card and both nodes; removing connected status `4` was blocked with the node and outcome named. The user's open project was not changed.
 - Changelog, canonical source synchronization, and GitHub publication are included in Task 5.
-

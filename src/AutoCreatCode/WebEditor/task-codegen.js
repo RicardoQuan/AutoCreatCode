@@ -1,6 +1,8 @@
 (() => {
   'use strict';
 
+  const FLOW_STATUS_CODES_ATTRIBUTE_NAMESPACE = 'BoTech.EquipmentFlow.Metadata';
+
   const KEYWORDS = new Set(('abstract as base bool break byte case catch char checked class const continue decimal default delegate do double else enum event explicit extern false finally fixed float for foreach goto if implicit in int interface internal is lock long namespace new null object operator out override params private protected public readonly ref return sbyte sealed short sizeof stackalloc static string struct switch this throw true try typeof uint ulong unchecked unsafe ushort using virtual void volatile while async await').split(' '));
 
   // Task identity and template helpers used by all three generated partial classes.
@@ -24,7 +26,8 @@
       ClassModifier: '',
       PrimarySource: '',
       TemplateFiles: [],
-      MethodCategories: [{ Name: '通用', RegionName: '通用', Order: 0 }],
+      MethodCategories: [{ Name: 'Common', RegionName: 'Common', Order: 0 }],
+      MethodVariables: [],
       CreatedFromTemplate: false,
     };
   }
@@ -87,6 +90,45 @@
     return region || '未分类';
   }
 
+  function taskVariableLiteral(task, variable, type) {
+    const value = String(variable.InitialValue == null ? '' : variable.InitialValue).trim();
+    const ownerName = task.ClassName || task.Name || 'Task';
+    const invalid = () => { throw new Error(`${ownerName} 的变量「${variable.Name}」初始值「${value}」不是有效的 ${type} 值。`); };
+    if (type === 'string') return JSON.stringify(String(variable.InitialValue == null ? '' : variable.InitialValue))
+      .replace(/\u0085/g, '\\u0085').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
+    if (type === 'bool') {
+      if (!/^(true|false)$/i.test(value)) invalid();
+      return value.toLowerCase();
+    }
+    if (type === 'int' || type === 'long') {
+      if (!/^[+-]?\d+$/.test(value)) invalid();
+      const number = BigInt(value);
+      const min = type === 'int' ? -2147483648n : -9223372036854775808n;
+      const max = type === 'int' ? 2147483647n : 9223372036854775807n;
+      if (number < min || number > max) invalid();
+      if (number === min) return `${type}.MinValue`;
+      return `${number}${type === 'long' ? 'L' : ''}`;
+    }
+    if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(value)) invalid();
+    const number = Number(value);
+    if (!Number.isFinite(number) || (number === 0 && /[1-9]/.test(value.replace(/[eE].*$/, '')))) invalid();
+    const normalized = value.replace(/\.(?=[eE]|$)/, '.0');
+    if (type === 'float') {
+      if (Math.abs(number) > 3.402823466e38 || (number !== 0 && Math.abs(number) < 1.401298464e-45)) invalid();
+      return `${normalized}f`;
+    }
+    if (type === 'double') return `${normalized}d`;
+    if (/[eE]/.test(value)) invalid();
+    const unsigned = value.replace(/^[+-]/, '');
+    const [whole, rawFraction = ''] = unsigned.split('.');
+    const fraction = rawFraction.replace(/0+$/, '');
+    const mantissa = BigInt((whole || '0') + fraction);
+    const max = 79228162514264337593543950335n;
+    if (fraction.length > 28 || mantissa > max) invalid();
+    const sign = value.startsWith('-') && mantissa !== 0n ? '-' : '';
+    return `${sign}${BigInt(whole || '0')}${fraction ? '.' + fraction : ''}m`;
+  }
+
   function taskTypeDeclaration(task) {
     const access = task.AccessModifier === 'internal' ? 'internal' : 'public';
     const modifier = task.ClassModifier === 'abstract' || task.ClassModifier === 'sealed' ? task.ClassModifier : '';
@@ -108,18 +150,29 @@
     return -1;
   }
 
-  function replaceTaskBaseType(suffix, baseType) {
+  function replaceTaskBaseType(suffix, baseType, sourceBaseType) {
     const requestedBase = String(baseType || '').trim();
-    if (!requestedBase) return suffix;
     const whereIndex = suffix.search(/\bwhere\b/);
     const inheritanceEnd = whereIndex >= 0 ? whereIndex : suffix.length;
     const colonIndex = suffix.indexOf(':');
     if (colonIndex >= 0 && colonIndex < inheritanceEnd) {
       const baseList = suffix.slice(colonIndex + 1, inheritanceEnd);
       const commaIndex = findTopLevelComma(baseList);
-      const preservedInterfaces = commaIndex >= 0 ? baseList.slice(commaIndex) : '';
-      return suffix.slice(0, colonIndex + 1) + ' ' + requestedBase + preservedInterfaces + suffix.slice(inheritanceEnd);
+      const sourceHadBase = Boolean(String(sourceBaseType || '').trim());
+      const interfaces = sourceHadBase
+        ? (commaIndex >= 0 ? baseList.slice(commaIndex + 1).trim() : '')
+        : baseList.trim();
+      const prefix = suffix.slice(0, colonIndex).replace(/\s+$/, '');
+      const constraints = suffix.slice(inheritanceEnd).trim();
+      const constraintSuffix = constraints ? ` ${constraints}` : '';
+      if (!sourceHadBase) {
+        if (!requestedBase) return suffix;
+        return prefix + ` : ${requestedBase}` + (interfaces ? `, ${interfaces}` : '') + constraintSuffix;
+      }
+      if (!requestedBase) return prefix + (interfaces ? ` : ${interfaces}` : '') + constraintSuffix;
+      return prefix + ` : ${requestedBase}` + (interfaces ? `, ${interfaces}` : '') + constraintSuffix;
     }
+    if (!requestedBase) return suffix;
     const insertionIndex = whereIndex >= 0 ? whereIndex : suffix.length;
     const beforeConstraints = suffix.slice(0, insertionIndex).replace(/\s+$/, '');
     return beforeConstraints + ' : ' + requestedBase + suffix.slice(insertionIndex);
@@ -131,7 +184,8 @@
     const declaration = new RegExp('^\\s*(?:(?:public|protected|internal|private|abstract|sealed|static|partial|file|unsafe|new)\\s+)*class\\s+' + type.name + '\\b([\\s\\S]*)$');
     const match = declaration.exec(header);
     if (!match) return source;
-    const updatedHeader = taskTypeDeclaration(task) + replaceTaskBaseType(match[1], task.BaseType);
+    const sourceBaseType = task.SourceBaseType == null ? task.BaseType : task.SourceBaseType;
+    const updatedHeader = taskTypeDeclaration(task) + replaceTaskBaseType(match[1], task.BaseType, sourceBaseType);
     return source.slice(0, type.DeclarationStart) + updatedHeader + source.slice(type.HeaderEnd);
   }
 
@@ -173,23 +227,64 @@
     return `${missing.join('\r\n')}\r\n${source}`;
   }
 
-  // Methods partial: preserve source and group generated methods by their Task category.
+  function taskMemberVariableSource(task, variable) {
+    const name = String(variable.Name || '').trim();
+    if (!validIdentifier(name)) throw new Error(`${task.ClassName} 的变量名「${name}」不是有效的 C# 标识符。`);
+    if (name.toLowerCase() === String(task.ClassName || '').toLowerCase())
+      throw new Error(`${task.ClassName} 的变量「${name}」与类名相同，请修改名称。`);
+    const type = String(variable.Type || '').toLowerCase();
+    if (!['bool', 'int', 'string', 'long', 'float', 'double', 'decimal'].includes(type))
+      throw new Error(`${task.ClassName} 的变量「${name}」类型「${variable.Type}」不受支持。`);
+    const kind = String(variable.MemberKind || 'field').toLowerCase();
+    if (kind !== 'field' && kind !== 'property')
+      throw new Error(`${task.ClassName} 的变量「${name}」成员类型「${variable.MemberKind}」无效。`);
+    const access = ['public', 'protected internal', 'protected', 'internal', 'private protected', 'private'].includes(variable.AccessModifier)
+      ? variable.AccessModifier : 'public';
+    const modifiers = (Array.isArray(variable.Modifiers) ? variable.Modifiers : [])
+      .filter(modifier => ['static', 'readonly', 'volatile', 'const', 'new', 'required'].includes(modifier));
+    const modifierText = modifiers.length ? modifiers.join(' ') + ' ' : '';
+    const initializer = variable.HasInitialValue
+      ? ` = ${String(variable.InitializerSource || '').trim() || taskVariableLiteral(task, variable, type)}` : '';
+    const accessors = String(variable.AccessorSource || '').trim();
+    return kind === 'field'
+      ? `${access} ${modifierText}${type} ${name}${initializer};`
+      : `${access} ${modifierText}${type} ${name} { ${accessors || 'get; set;'} }${initializer}${initializer ? ';' : ''}`;
+  }
+
+  // Methods partial: preserve source and group generated members by their Task category.
   function methodsSource(task, methods) {
     const items = (methods || []).filter(method => method.MethodName !== 'AutoRun' && (!method.TaskId || method.TaskId === task.TaskId));
     const categories = [];
     const grouped = new Map();
-    (task.MethodCategories || []).forEach(item => {
-      const category = item && safeRegion(item.Name);
+    const methodCategories = (task.MethodCategories || []).slice().sort((left, right) => {
+      const leftName = typeof left === 'string' ? left : left && (left.Name || left.RegionName) || '';
+      const rightName = typeof right === 'string' ? right : right && (right.Name || right.RegionName) || '';
+      return (Number(left && left.Order) || 0) - (Number(right && right.Order) || 0);
+    });
+    methodCategories.forEach(item => {
+      const categoryName = typeof item === 'string' ? item : item && (item.Name || item.RegionName);
+      const category = categoryName && safeRegion(categoryName);
       if (category && !categories.some(name => name.toLowerCase() === category.toLowerCase())) { grouped.set(category, []); categories.push(category); }
+    });
+    const memberNames = new Set(['autorun', String(task.ClassName || '').toLowerCase(), ...items.map(method => String(method.MethodName || '').toLowerCase())]);
+    (Array.isArray(task.MethodVariables) ? task.MethodVariables : []).forEach(variable => {
+      const name = String(variable.Name || '').trim();
+      const key = name.toLowerCase();
+      if (memberNames.has(key)) throw new Error(`${task.ClassName} 的自定义变量「${name}」与 Task 成员或方法重名。`);
+      memberNames.add(key);
+      const requestedRegion = safeRegion(variable.RegionName || variable.Region || categories[0] || 'Common');
+      const registered = categories.find(name => name.toLowerCase() === requestedRegion.toLowerCase()) || requestedRegion;
+      if (!grouped.has(registered)) { grouped.set(registered, []); categories.push(registered); }
+      grouped.get(registered).push(taskMemberVariableSource(task, variable));
     });
     items.forEach(method => {
       const category = safeRegion(method.Category);
       const registered = categories.find(name => name.toLowerCase() === category.toLowerCase()) || category;
       if (!grouped.has(registered)) { grouped.set(registered, []); categories.push(registered); }
-      grouped.get(registered).push(method);
+      grouped.get(registered).push(methodSource(method));
     });
     const declarations = categories.map(category =>
-      `    #region ${category}\r\n${grouped.get(category).map(method => indent(methodSource(method), 8)).join('\r\n\r\n')}\r\n    #endregion`);
+      `    #region ${category}\r\n${grouped.get(category).map(member => indent(member, 8)).join('\r\n\r\n')}\r\n    #endregion`);
     return `using System;\r\n\r\nnamespace ${task.Namespace || 'BoTech'}\r\n{\r\n    ${taskTypeDeclaration(task)}\r\n    {\r\n${declarations.length ? declarations.join('\r\n\r\n') + '\r\n' : ''}    }\r\n}\r\n`;
   }
 
@@ -352,14 +447,14 @@
       ...uniqueFields,
       '',
       '        // Generated from the flow canvas.',
-      '        public override void AutoRun()',
+      `        public ${String(task.BaseType || '').trim() ? 'override ' : ''}void AutoRun()`,
       '        {',
       '            switch (StaInfo.StepIdx)',
       '            {',
     ];
 
     const emittedStateValues = new Set();
-    steps.ordered.forEach((node, index) => {
+    steps.ordered.forEach(node => {
       const outgoing = transitions.filter(edge => edge.FromNodeId === node.NodeId).sort((a, b) => Number(a.Priority || 0) - Number(b.Priority || 0));
       const method = methodById.get(node.MethodId);
       const currentStep = steps.byId.get(node.NodeId);
@@ -402,7 +497,7 @@
           if (next) lines.push(...transitionLines(next.ToNodeId, '                    '));
           lines.push('                    break;');
         } else if (method.ReturnType === 'bool') {
-          lines.push(`                    bool __webUiResult${index} = ${call};`, `                    switch (__webUiResult${index})`, '                    {');
+          lines.push(`                    switch (${call})`, '                    {');
           ['true', 'false'].forEach(outcome => {
             const edge = outgoing.find(item => String(item.Outcome).toLowerCase() === outcome);
             if (edge) lines.push(`                        case ${outcome}: ${transitionLines(edge.ToNodeId, '').join(' ').trim()} break;`);
@@ -411,7 +506,7 @@
           if (fallback) lines.push(`                        default: ${transitionLines(fallback.ToNodeId, '').join(' ').trim()} break;`, '                    }', '                    break;');
           else lines.push('                        default: break;', '                    }', '                    break;');
         } else if (method.ReturnType === 'int') {
-          lines.push(`                    int __webUiResult${index} = ${call};`, `                    switch (__webUiResult${index})`, '                    {');
+          lines.push(`                    switch (${call})`, '                    {');
           const usedStatuses = new Set();
           (method.PendingStatusCodes || []).map(String).forEach(code => {
             if (!/^-?\d+$/.test(code)) return;
@@ -445,18 +540,21 @@
   }
 
   function generatedPrimarySource(task, flow, methods) {
-    const members = generateFlowMembers(flow, methods, task);
+    const hasExecutableFlow = Boolean(flow && (flow.Nodes || []).some(node => node && !['Start', 'End'].includes(node.NodeType)));
+    const members = hasExecutableFlow ? generateFlowMembers(flow, methods, task) : '';
     const template = templateResiduals(task);
     const marker = '    #region WebUI Auto Flow';
     const dataBlock = template.additionalResiduals.length
       ? `    #region Task Template Members\r\n${indent(template.additionalResiduals.join('\r\n\r\n'), 8)}\r\n    #endregion\r\n\r\n`
       : '';
-    const block = `${dataBlock}${marker}\r\n${indent(members, 4)}\r\n    #endregion`;
+    const flowBlock = members ? `${marker}\r\n${indent(members, 4)}\r\n    #endregion` : '';
+    const block = [dataBlock.trimEnd(), flowBlock].filter(Boolean).join('\r\n\r\n');
     const methodUsings = Array.from(new Set((methods || []).filter(method => !method.TaskId || method.TaskId === task.TaskId)
       .flatMap(method => method.ImportedUsings || [])));
     let source = String(task.PrimarySource || '').trim();
     if (!source) {
-      source = `using System;\r\n\r\nnamespace ${task.Namespace || 'BoTech'}\r\n{\r\n    ${taskTypeDeclaration(task)} : ${task.BaseType || 'TaskBase_MoverStation'}\r\n    {\r\n    }\r\n}\r\n`;
+      const baseType = String(task.BaseType || '').trim();
+      source = `using System;\r\n\r\nnamespace ${task.Namespace || 'BoTech'}\r\n{\r\n    ${taskTypeDeclaration(task)}${baseType ? ` : ${baseType}` : ''}\r\n    {\r\n    }\r\n}\r\n`;
     } else {
       const primary = (task.TemplateFiles || []).find(file => file.Path === task.TemplatePrimaryPath);
       if (primary) {
@@ -493,6 +591,7 @@
     const parsed = window.EquipmentFlowCSharpCatalog.parseSource(source, `${task.ClassName}.cs`);
     const type = parsed.classes.find(item => item.name === task.ClassName && item.namespace === (task.Namespace || 'BoTech'));
     if (!type) throw new Error(`Task 主源码中未找到 ${task.Namespace || 'BoTech'}.${task.ClassName}。`);
+    if (!block) return source;
     return source.slice(0, type.BodyEnd) + '\r\n\r\n' + block + '\r\n' + source.slice(type.BodyEnd);
   }
 
@@ -667,15 +766,55 @@
   function generatedMethodsSource(task, methods) {
     const template = templateResiduals(task);
     let generated = methodsSource(task, methods);
-    const importedUsings = Array.from(new Set((methods || []).filter(method => !method.TaskId || method.TaskId === task.TaskId)
+    const taskMethods = (methods || []).filter(method => method.MethodName !== 'AutoRun' && (!method.TaskId || method.TaskId === task.TaskId));
+    const importedUsings = Array.from(new Set(taskMethods
       .flatMap(method => method.ImportedUsings || [])));
-    return mergeUsings(generated, [...template.imports, ...importedUsings]);
+    if (hasFlowStatusCodesAttribute(taskMethods)) importedUsings.push(`using ${FLOW_STATUS_CODES_ATTRIBUTE_NAMESPACE};`);
+    return mergeUsings(generated, Array.from(new Set([...template.imports, ...importedUsings])));
+  }
+
+  function hasFlowStatusCodesAttribute(methods) {
+    return (methods || []).some(method => /\bFlowStatusCodes(?:Attribute)?\s*\(/.test([
+      method.AttributeSource || '', method.SourceCode || '',
+    ].join('\n')));
+  }
+
+  function flowStatusCodesSupportFiles(methods) {
+    if (!hasFlowStatusCodesAttribute(methods)) return [];
+    return [{
+      fileName: 'FlowStatusCodesAttribute.cs',
+      source: [
+        'using System;',
+        '',
+        `namespace ${FLOW_STATUS_CODES_ATTRIBUTE_NAMESPACE}`,
+        '{',
+        '    [AttributeUsage(AttributeTargets.Method, AllowMultiple = false, Inherited = false)]',
+        '    public sealed class FlowStatusCodesAttribute : Attribute',
+        '    {',
+        '        public FlowStatusCodesAttribute(params int[] statusCodes)',
+        '        {',
+        '            StatusCodes = statusCodes ?? new int[0];',
+        '        }',
+        '',
+        '        public int[] StatusCodes { get; private set; }',
+        '    }',
+        '}',
+        '',
+      ].join('\r\n'),
+    }];
   }
 
   // A panel export builds only its own partial; an unfinished sibling does not block it.
   function generateSingleSource(kind, task, flow, methods, hardwareDefinitions = [], enumNamespace = 'ParName', enumResources = null) {
     if (kind === 'flow') return { fileName: task.ClassName + '.cs', source: generatedPrimarySource(task, flow, methods) };
-    if (kind === 'methods') return { fileName: task.ClassName + '_Methods.cs', source: generatedMethodsSource(task, methods) };
+    if (kind === 'methods') {
+      const taskMethods = (methods || []).filter(method => method.MethodName !== 'AutoRun' && (!method.TaskId || method.TaskId === task.TaskId));
+      return {
+        fileName: task.ClassName + '_Methods.cs',
+        source: generatedMethodsSource(task, taskMethods),
+        supportFiles: flowStatusCodesSupportFiles(taskMethods),
+      };
+    }
     if (kind === 'hardware') return {
       fileName: task.ClassName + '_Hardware.cs',
       source: hardwareSource(task, hardwareDefinitions, enumNamespace, enumResources),
@@ -693,6 +832,7 @@
       taskSource: generatedTaskSource.source,
       methodsFileName: generatedMethodsSource.fileName,
       methodsSource: generatedMethodsSource.source,
+      supportFiles: generatedMethodsSource.supportFiles || [],
       hardwareFileName: generatedHardwareSource.fileName,
       hardwareSource: generatedHardwareSource.source,
     };

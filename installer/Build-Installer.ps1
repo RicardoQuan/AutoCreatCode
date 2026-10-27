@@ -56,7 +56,6 @@ $hostProject = Join-Path $repositoryRoot 'src\AutoCreatCode\AutoCreatCode.csproj
 $formatterProject = Join-Path $repositoryRoot 'src\AutoCreatCode\WebEditor\tools\csharpier-formatter\CSharpierFormatter.csproj'
 $installScript = Join-Path $PSScriptRoot 'Install.ps1'
 $uninstallScript = Join-Path $PSScriptRoot 'Uninstall.ps1'
-$launchScript = Join-Path $PSScriptRoot 'Launch.vbs'
 $distRoot = Join-Path $repositoryRoot 'dist'
 
 if (-not $IsWindows -and $env:OS -ne 'Windows_NT') {
@@ -78,6 +77,13 @@ try {
     $prerequisiteRoot = Join-Path $payloadRoot 'prerequisites'
     $appRoot = Join-Path $payloadRoot 'app'
     New-Item -ItemType Directory -Path $appOutput, $formatterOutput, $formatterBuildRoot, $prerequisiteRoot, $appRoot -Force | Out-Null
+
+    $stagedInstallScript = Join-Path $workRoot 'Install.ps1'
+    $installScriptContent = [System.IO.File]::ReadAllText($installScript).Replace('__VERSION__', $Version)
+    if ($installScriptContent -match '__VERSION__') {
+        throw '安装脚本版本占位符未能替换。'
+    }
+    [System.IO.File]::WriteAllText($stagedInstallScript, $installScriptContent, [System.Text.UTF8Encoding]::new($false))
 
     Invoke-DotNet @('build', $hostProject, '--configuration', 'Release', "-p:Version=$Version.0") '桌面宿主构建'
     $hostOutput = Join-Path $repositoryRoot 'src\AutoCreatCode\bin\Release\net48'
@@ -124,8 +130,7 @@ try {
 
     $iexpressSource = Join-Path $workRoot 'iexpress-source'
     New-Item -ItemType Directory -Path $iexpressSource -Force | Out-Null
-    Copy-Item -LiteralPath $installScript -Destination $iexpressSource -Force
-    Copy-Item -LiteralPath $launchScript -Destination $iexpressSource -Force
+    Copy-Item -LiteralPath $stagedInstallScript -Destination $iexpressSource -Force
     Copy-Item -LiteralPath $payloadZip -Destination $iexpressSource -Force
 
     $setupPath = Join-Path $distRoot "AutoCreatCode-Setup-v$Version.exe"
@@ -140,8 +145,8 @@ Class=IEXPRESS
 SEDVersion=3
 [Options]
 PackagePurpose=InstallApp
-ShowInstallProgramWindow=0
-HideExtractAnimation=1
+ShowInstallProgramWindow=1
+HideExtractAnimation=0
 UseLongFileName=1
 InsideCompressed=1
 CAB_FixedSize=0
@@ -152,7 +157,7 @@ DisplayLicense=
 FinishMessage=
 TargetName=$setupStagingPath
 FriendlyName=AutoCreatCode V$Version
-AppLaunched=wscript.exe Launch.vbs
+AppLaunched=powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File Install.ps1
 PostInstallCmd=<None>
 AdminQuietInstCmd=
 UserQuietInstCmd=
@@ -162,11 +167,9 @@ SourceFiles0=$iexpressSource
 [SourceFiles0]
 %FILE0%=
 %FILE1%=
-%FILE2%=
 [Strings]
 FILE0="Install.ps1"
-FILE1="Launch.vbs"
-FILE2="payload.zip"
+FILE1="payload.zip"
 "@
     Set-Content -LiteralPath $sedPath -Value $sed -Encoding ASCII
 
@@ -250,4 +253,3 @@ finally {
         Remove-Item -LiteralPath $fullWorkRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
-

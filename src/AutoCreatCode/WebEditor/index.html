@@ -37,6 +37,8 @@
             <div class="popover-heading"><strong>Task 文件</strong><span id="stationCount" class="count-badge">0</span></div>
             <div class="task-manager-actions">
               <button id="newTaskMenuButton" class="task-binding-button task-bind-apply" type="button">＋ 新建 Task</button>
+              <button id="copyTaskAsNewButton" class="task-binding-button" type="button" disabled>复制为新 Task</button>
+              <button id="copyTaskIntoExistingButton" class="task-binding-button" type="button" disabled>复制到已有 Task</button>
               <button id="deleteTaskButton" class="task-binding-button task-delete-button" type="button" disabled>删除当前 Task</button>
             </div>
             <div class="task-type-settings">
@@ -48,7 +50,7 @@
               </div>
               <p id="taskClassModifierHint" class="task-class-hint" aria-live="polite"></p>
             </div>
-            <label class="field"><span>当前 Task 生成目录</span><div class="task-output-directory"><input id="taskOutputDirectoryInput" type="text" readonly placeholder="默认按 TaskName 建目录"><button id="chooseTaskOutputDirectoryButton" class="catalog-action" type="button" disabled>选择</button></div></label>
+            <label class="field"><span>项目统一 C# 输出目录</span><div class="task-output-directory"><input id="taskOutputDirectoryInput" type="text" readonly placeholder="选择一次，所有 Task 共用"><button id="chooseTaskOutputDirectoryButton" class="catalog-action" type="button" disabled>选择</button></div></label>
             <div class="menu-divider"></div>
             <div class="menu-caption">已暂存 Task</div>
             <div id="stationList" class="station-list"><div class="empty-inline">新建 Task 或导入 Task 模板</div></div>
@@ -143,7 +145,8 @@
               <option value="">全部 Region</option>
             </select>
           </div>
-          <div class="method-import-actions"><button id="newMethodButton" class="catalog-action action-create" type="button" title="新增函数" disabled>＋ 方法</button><button id="importMethodsButton" class="catalog-action action-import" type="button" title="导入 .cs 方法" disabled>导入 .cs</button><button id="manageMethodRegionsButton" class="catalog-action action-manage" type="button" title="管理方法分类 Region" disabled>Region</button></div>
+          <div class="method-import-actions"><button id="newMethodButton" class="catalog-action action-create" type="button" title="新增函数" disabled>＋ 方法</button><button id="manageTaskVariablesButton" class="catalog-action action-create" type="button" title="管理 Task 字段和属性" disabled>＋ 变量</button><button id="importMethodsButton" class="catalog-action action-import" type="button" title="导入 .cs 方法" disabled>导入 .cs</button><button id="manageMethodRegionsButton" class="catalog-action action-manage" type="button" title="管理方法分类 Region" disabled>Region</button></div>
+          <section id="taskVariableSummary" class="task-variable-summary hidden" aria-label="Task 变量定义"></section>
           <div id="methodList" class="method-list"><div class="empty-inline">先新建或导入 Task</div></div>
           <div class="rail-hint"><span class="hint-dot"></span>拖入方法创建节点，拖到节点上绑定</div>
         </section>
@@ -252,6 +255,15 @@
       <label class="field"><span>Task 名称 / C# 类名</span><input id="newTaskName" type="text" required maxlength="80" autocomplete="off" placeholder="例如 Task02_Work1"></label>
       <small class="dialog-hint">使用 C# 标识符；文件名会按此名称生成。</small>
       <footer class="editor-dialog-footer"><button type="button" class="button button-quiet" data-close-dialog="taskDialog">取消</button><button id="createTaskButton" class="button button-primary" type="submit">创建 Task</button></footer>
+    </form>
+  </dialog>
+  <dialog id="copyTaskTargetDialog" class="editor-dialog" aria-labelledby="copyTaskTargetTitle">
+    <form id="copyTaskTargetForm" method="dialog">
+      <header class="editor-dialog-header"><div><span class="template-eyebrow">TASK · COPY</span><h2 id="copyTaskTargetTitle">复制到已有 Task</h2><p id="copyTaskTargetSource"></p></div><button type="button" class="dialog-close" data-close-dialog="copyTaskTargetDialog" aria-label="关闭">×</button></header>
+      <label class="field"><span>目标 Task</span><select id="copyTaskTargetSelect" required></select></label>
+      <div id="copyTaskTargetSummary" class="copy-task-summary" aria-live="polite"></div>
+      <small class="dialog-hint">确认后会替换目标 Task 的配置、方法、流程、画布布局和硬件定义；目标命名空间、类名与输出目录保留。</small>
+      <footer class="editor-dialog-footer"><button type="button" class="button button-quiet" data-close-dialog="copyTaskTargetDialog">取消</button><button id="confirmCopyTaskIntoExistingButton" class="button button-primary" type="submit">复制并替换</button></footer>
     </form>
   </dialog>
   <dialog id="methodDialog" class="editor-dialog method-editor-dialog" aria-labelledby="methodDialogTitle">
@@ -402,6 +414,17 @@
       <footer class="editor-dialog-footer"><button type="button" class="button button-quiet" data-close-dialog="methodRegionsDialog">完成</button></footer>
     </div>
   </dialog>
+  <dialog id="taskVariablesDialog" class="editor-dialog task-variables-dialog" aria-labelledby="taskVariablesTitle">
+    <form id="taskVariablesForm" method="dialog">
+      <header class="editor-dialog-header"><div><span class="template-eyebrow">TASK · MEMBERS</span><h2 id="taskVariablesTitle">Task 变量定义</h2><p>字段和属性与函数同级，生成在 Task 方法 partial 的函数外；所有方法可共用，并可指定 Region。</p></div><button type="button" class="dialog-close" data-close-dialog="taskVariablesDialog" aria-label="关闭">×</button></header>
+      <section class="method-variables-section" aria-label="Task 字段和属性">
+        <div class="subsection-heading"><strong>字段与属性</strong><button id="addTaskVariableButton" class="catalog-action" type="button">＋ 添加变量</button></div>
+        <div id="methodCustomVariableRows" class="method-custom-variable-rows"></div>
+      </section>
+      <div id="taskVariablesDialogError" class="dialog-error hidden" role="alert"></div>
+      <footer class="editor-dialog-footer"><button type="button" class="button button-quiet" data-close-dialog="taskVariablesDialog">取消</button><button id="saveTaskVariablesButton" class="button button-primary" type="submit">保存变量定义</button></footer>
+    </form>
+  </dialog>
   <input id="enumWorkbookFile" type="file" accept=".xlsx,.csv,.tsv" hidden>
   <dialog id="hardwareDialog" class="editor-dialog hardware-dialog" aria-labelledby="hardwareDialogTitle">
     <form id="hardwareForm" method="dialog">
@@ -457,4 +480,3 @@
   <script src="editor.js"></script>
 </body>
 </html>
-

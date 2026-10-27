@@ -53,6 +53,16 @@
         index = end + 2;
         continue;
       }
+      if (char === '#') {
+        const lineStart = source.lastIndexOf('\n', index - 1) + 1;
+        if (!source.slice(lineStart, index).trim()) {
+          const directive = source.slice(index).match(/^#\s*(?:region|endregion)\b[^\r\n]*/i);
+          if (directive) {
+            index += directive[0].length;
+            continue;
+          }
+        }
+      }
       if (char === '"' || char === '@' || char === '$') {
         let quoteIndex = index;
         let prefix = '';
@@ -362,7 +372,7 @@
     return null;
   }
 
-  function collectTypes(tokens, pairs, declarations) {
+  function collectTypes(source, tokens, pairs, declarations) {
     const classes = [];
     const enums = [];
     for (let index = 0; index < tokens.length; index += 1) {
@@ -410,6 +420,14 @@
       if (!nameToken || nameToken.kind !== 'identifier') continue;
       const body = findBody(tokens, nameIndex + 1, pairs);
       if (!body) continue;
+      const headerTokens = tokens.slice(nameIndex + 1, body.open);
+      const whereIndex = headerTokens.findIndex(token => token.value === 'where');
+      const inheritanceHeader = whereIndex < 0 ? headerTokens : headerTokens.slice(0, whereIndex);
+      const baseSeparator = inheritanceHeader.findIndex(token => token.value === ':');
+      const baseTypeTokens = baseSeparator < 0
+        ? []
+        : splitTopLevel(inheritanceHeader.slice(baseSeparator + 1), ',')[0] || [];
+      const baseType = baseTypeTokens.length ? sourceText(source, baseTypeTokens).trim() : '';
       let modifierStart = index - 1;
       while (modifierStart >= 0 && ![';', '{', '}', ']', ')'].includes(tokens[modifierStart].value)) modifierStart -= 1;
       const declarationModifiers = new Set(tokens.slice(modifierStart + 1, index).map(token => token.value));
@@ -419,6 +437,7 @@
         name: nameToken.value,
         namespace: namespace,
         fullName: [namespace, nameToken.value].filter(Boolean).join('.'),
+        BaseType: baseType,
         kind: kind,
         AccessModifier: accessModifier,
         Modifiers: Array.from(declarationModifiers),
@@ -667,6 +686,118 @@
     return methods;
   }
 
+  function memberHeader(source, tokens, pairs) {
+    let cursor = 0;
+    while (tokens[cursor] && tokens[cursor].value === '[' && pairs.has(tokens[cursor].index)) {
+      const close = pairs.get(tokens[cursor].index);
+      const next = tokens.findIndex(token => token.index === close);
+      if (next < 0) return null;
+      cursor = next + 1;
+    }
+    const modifiers = [];
+    while (tokens[cursor] && MODIFIERS.has(tokens[cursor].value)) modifiers.push(tokens[cursor++].value);
+    if (!tokens[cursor] || tokens.slice(cursor).some(token => ['(', '=>', 'class', 'struct', 'record', 'enum', 'interface', 'delegate', 'event', 'operator'].includes(token.value))) return null;
+    let nameIndex = -1;
+    for (let index = cursor; index < tokens.length; index += 1) {
+      if (tokens[index].kind === 'identifier') nameIndex = index;
+    }
+    if (nameIndex <= cursor) return null;
+    const typeName = sourceText(source, tokens.slice(cursor, nameIndex)).replace(/\s+/g, '');
+    if (!typeName || !/^[\w.:<>?,\[\]]+$/.test(typeName)) return null;
+    const access = modifiers.includes('protected') && modifiers.includes('internal') ? 'protected internal'
+      : modifiers.includes('private') && modifiers.includes('protected') ? 'private protected'
+        : modifiers.find(value => ['public', 'protected', 'internal', 'private'].includes(value)) || 'private';
+    return { Name: tokens[nameIndex].value, TypeName: typeName, AccessModifier: access, Modifiers: modifiers };
+  }
+
+  function classMemberVariables(source, tokens, pairs, depths, type) {
+    const variables = [];
+    const directDepth = depths[type.bodyOpen] + 1;
+    let memberStart = type.bodyOpen + 1;
+    const addFieldGroup = group => {
+      const assignmentIndex = group.findIndex(token => token.value === '=' && depths[token.index] === directDepth);
+      const declaration = assignmentIndex < 0 ? group : group.slice(0, assignmentIndex);
+      const parsed = memberHeader(source, declaration, pairs);
+      if (!parsed) return;
+      const initializer = assignmentIndex < 0 ? '' : sourceText(source, group.slice(assignmentIndex + 1));
+      variables.push({ ...parsed, MemberKind: 'field', InitializerSource: initializer,
+        Line: group[0]?.line || 0, SourceStart: group[0]?.start || 0, SourceEnd: group[group.length - 1]?.end || 0 });
+    };
+    const parseField = segment => {
+      const groups = splitTopLevel(segment, ',');
+      if (!groups.length) return;
+      addFieldGroup(groups[0]);
+      if (groups.length === 1) return;
+      const firstAssignment = groups[0].findIndex(token => token.value === '=' && depths[token.index] === directDepth);
+      const firstDeclaration = firstAssignment < 0 ? groups[0] : groups[0].slice(0, firstAssignment);
+      const first = memberHeader(source, firstDeclaration, pairs);
+      if (!first) return;
+      for (const group of groups.slice(1)) {
+        const assignmentIndex = group.findIndex(token => token.value === '=' && depths[token.index] === directDepth);
+        const declaration = assignmentIndex < 0 ? group : group.slice(0, assignmentIndex);
+        const nameToken = declaration.slice().reverse().find(token => token.kind === 'identifier');
+        if (!nameToken) continue;
+        const initializer = assignmentIndex < 0 ? '' : sourceText(source, group.slice(assignmentIndex + 1));
+        variables.push({ ...first, Name: nameToken.value, MemberKind: 'field', InitializerSource: initializer,
+          Line: group[0]?.line || 0, SourceStart: group[0]?.start || 0, SourceEnd: group[group.length - 1]?.end || 0 });
+      }
+    };
+    for (let index = type.bodyOpen + 1; index < type.bodyClose; index += 1) {
+      if (depths[index] !== directDepth) continue;
+      if (tokens[index].value === '#') {
+        const directiveLine = tokens[index].line;
+        while (index + 1 < type.bodyClose && tokens[index + 1].line === directiveLine) index += 1;
+        memberStart = index + 1;
+        continue;
+      }
+      if (tokens[index].value === '(' && pairs.has(index)) {
+        const hasFieldInitializer = tokens.slice(memberStart, index).some(token => token.value === '=' && depths[token.index] === directDepth);
+        const parsed = hasFieldInitializer ? null : parseMethodFromMember(source, tokens, pairs, memberStart, index, []);
+        if (parsed) {
+          index = findMethodBodyEnd(tokens, pairs, parsed.closeParen);
+          memberStart = index + 1;
+          continue;
+        }
+      }
+      if (tokens[index].value === '{' && pairs.has(index)) {
+        const close = pairs.get(index);
+        const header = tokens.slice(memberStart, index);
+        const body = tokens.slice(index + 1, close);
+        const hasAccessor = body.some(token => ['get', 'set', 'init'].includes(token.value));
+        if (hasAccessor && !header.some(token => ['=', '=>'].includes(token.value))) {
+          const parsed = memberHeader(source, header, pairs);
+          if (parsed) {
+            let initializerSource = '';
+            let endIndex = close;
+            if (tokens[close + 1]?.value === '=') {
+              let semicolon = close + 2;
+              while (semicolon < type.bodyClose && !(tokens[semicolon].value === ';' && depths[semicolon] === directDepth)) semicolon += 1;
+              if (semicolon < type.bodyClose) {
+                initializerSource = sourceText(source, tokens.slice(close + 2, semicolon));
+                endIndex = semicolon;
+              }
+            }
+            variables.push({ ...parsed, MemberKind: 'property', AccessorSource: source.slice(tokens[index].end, tokens[close].start).trim(), InitializerSource: initializerSource,
+              Line: tokens[memberStart]?.line || tokens[index].line, SourceStart: tokens[memberStart]?.start || tokens[index].start,
+              SourceEnd: tokens[endIndex]?.end || tokens[close].end });
+            index = endIndex;
+            memberStart = index + 1;
+            continue;
+          }
+        }
+        const hasInitializer = header.some(token => token.value === '=');
+        index = close;
+        if (!hasInitializer) memberStart = index + 1;
+        continue;
+      }
+      if (tokens[index].value === ';') {
+        parseField(tokens.slice(memberStart, index));
+        memberStart = index + 1;
+      }
+    }
+    return variables;
+  }
+
   function parseHardwareSlotAttributes(tokens, memberStart, publicIndex, pairs) {
     const attributes = [];
     let index = memberStart;
@@ -743,10 +874,11 @@
     const tokens = tokenize(source);
     const structure = createPairs(tokens);
     const namespaces = namespaceDeclarations(tokens, structure.pairs);
-    const types = collectTypes(tokens, structure.pairs, namespaces);
+    const types = collectTypes(source, tokens, structure.pairs, namespaces);
     const factories = [];
     types.classes.forEach(type => {
       type.methods = parseClassMethods(source, tokens, structure.pairs, structure.depths, type);
+      type.memberVariables = classMemberVariables(source, tokens, structure.pairs, structure.depths, type);
       type.BodyStart = tokens[type.bodyOpen].end;
       type.BodyEnd = tokens[type.bodyClose].start;
       const classFactory = type.attributes.find(attribute => attribute.name === 'FlowNozzleFactory');
@@ -894,4 +1026,3 @@
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   if (typeof window !== 'undefined') window.EquipmentFlowCSharpCatalog = api;
 })();
-

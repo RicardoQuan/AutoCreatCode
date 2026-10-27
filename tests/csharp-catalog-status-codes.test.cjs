@@ -32,4 +32,3 @@ test('adds FlowStatusCodes when a method has no status metadata yet', () => {
   assert.match(updated, /<summary>Move\.<\/summary>/u);
   assert.match(updated, /return 0;/u);
 });
-

@@ -27,6 +27,9 @@ jobs:
       should_run: ${{ steps.release.outputs.should_run }}
       version: ${{ steps.release.outputs.version }}
     steps:
+      - name: Check out release source
+        uses: actions/checkout@v4
+
       - name: Resolve release version
         id: release
         shell: pwsh
@@ -45,14 +48,19 @@ jobs:
           } elseif ($env:REF_TYPE -eq 'tag') {
             $version = $env:REF_NAME -replace '^v', ''
           } else {
-            $version = '1.0'
+            $changelog = Get-Content -LiteralPath 'CHANGELOG.md' -Raw
+            $versionMatch = [regex]::Match($changelog, '(?m)^##\s+V(?<version>\d+\.\d+(?:\.\d+)?)\s*$')
+            if (-not $versionMatch.Success) {
+              throw 'CHANGELOG.md must start with the next release heading, for example ## V1.1.'
+            }
+            $version = $versionMatch.Groups['version'].Value
           }
           if ($version -notmatch '^\d+\.\d+(\.\d+)?$') {
             throw "Release version '$version' must use numeric major.minor[.patch] format."
           }
 
           $shouldRun = 'true'
-          if ($env:EVENT_NAME -eq 'push' -and $env:REF_TYPE -ne 'tag') {
+          if ($env:EVENT_NAME -eq 'push') {
             $releaseListJson = & gh release list --repo $env:REPOSITORY --limit 100 --json tagName
             if ($LASTEXITCODE -ne 0) {
               throw 'Unable to check existing GitHub Releases.'
@@ -124,4 +132,3 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "GitHub Release publishing failed with exit code $LASTEXITCODE."
           }
-

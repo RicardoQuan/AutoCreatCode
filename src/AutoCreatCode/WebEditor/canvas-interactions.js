@@ -363,6 +363,19 @@
     return outcomes.length ? outcomes : ['*'];
   }
 
+  function synchronizeEntryNode(flow, preferredNodeId = '') {
+    if (!flow || !Array.isArray(flow.Nodes)) return false;
+    const starts = flow.Nodes.filter(node => node && node.NodeType === 'Start'
+      && typeof node.NodeId === 'string' && node.NodeId);
+    const next = starts.find(node => node.NodeId === preferredNodeId)
+      || starts.find(node => node.NodeId === flow.EntryNodeId)
+      || (starts.length === 1 ? starts[0] : null);
+    const entryNodeId = next ? next.NodeId : '';
+    const changed = flow.EntryNodeId !== entryNodeId;
+    flow.EntryNodeId = entryNodeId;
+    return changed;
+  }
+
   function outcomeRatio(method, node, outcomes, code) {
     if (node && node.NodeType === 'Condition') return .5;
     const index = outcomes.indexOf(code);
@@ -500,7 +513,7 @@
     // The empty-state stays at viewport scale, even before any graph is loaded.
     const empty = document.getElementById('canvasEmpty');
     if (empty) viewport.appendChild(empty);
-    const ui = { zoom: 1, tool: 'select', selected: new Set(), edge: null, hoverEdge: null, hoverShared: false, hoverPointer: null, drag: null, space: false,
+    const ui = { zoom: 1, tool: 'select', selected: new Set(), edge: null, hoverEdge: null, hoverShared: false, hoverPointer: null, drag: null, space: false, lastNodeClick: null,
       connection: null, undo: [], redo: [], clipboard: null, key: '', extent: { width: 1600, height: 1200 } };
     const flow = () => adapter.getFlow();
     const layout = () => adapter.getLayout();
@@ -1197,7 +1210,7 @@
           flow().Transitions = flow().Transitions.filter(edge => !ids.has(edge.FromNodeId) && !ids.has(edge.ToNodeId));
           flow().Nodes.forEach(node => (node.Parameters || []).forEach(parameter => { if (ids.has(parameter.SourceNodeId)) { delete parameter.SourceNodeId; delete parameter.SourceParameterName; parameter.Value = ''; } }));
           ids.forEach(id => delete layout()[id]);
-          if (ids.has(flow().EntryNodeId)) flow().EntryNodeId = '';
+          synchronizeEntryNode(flow());
           ui.selected.clear(); adapter.setSelected(null);
         }
       });
@@ -1237,6 +1250,7 @@
           (edge.CanvasMergeLaneAnchors || []).forEach(point => { point.y += 40; });
           flow().Transitions.push(edge);
         });
+        synchronizeEntryNode(flow());
         adapter.setSelected([...ui.selected].pop()); ui.edge = null;
       });
     }
@@ -1311,6 +1325,7 @@
     function pointerDown(event) {
       if (!flow() || event.button > 1 || event.target.closest('input,select,textarea')) return;
       const p = pointFromClient(event.clientX, event.clientY), nodeEl = event.target.closest('.flow-node'), edgeEl = event.target.closest('[data-edge-index]');
+      if (!nodeEl) ui.lastNodeClick = null;
       if (event.button === 1 || ui.space || ui.tool === 'pan') {
         event.preventDefault(); ui.drag = { type: 'pan', x: event.clientX, y: event.clientY, left: viewport.scrollLeft, top: viewport.scrollTop }; viewport.classList.add('panning'); return;
       }
@@ -1323,13 +1338,26 @@
       }
       if (nodeEl) {
         event.preventDefault(); const id = nodeEl.dataset.nodeId, node = flow().Nodes.find(item => item.NodeId === id), port = event.target.closest('[data-port]');
+        if (!node) return;
         if (port || ui.tool === 'connect') {
+          ui.lastNodeClick = null;
           if (node.NodeType === 'End') return;
           updateEdgeHover(null);
           ui.connection = { source: id, port: port ? port.dataset.port : 's', ratio: Number(port && port.dataset.ratio) || .5,
             outcome: port && port.dataset.outcome, anchors: [], orientation: port && ['e', 'w'].includes(port.dataset.port) ? 'h' : 'v', cursor: p, mergeTarget: null };
           ui.drag = { type: 'connect', start: p };
           drawConnectionPreview(ui.connection); return;
+        }
+        const now = performance.now();
+        const previousClick = ui.lastNodeClick;
+        const isDoubleClick = previousClick && previousClick.id === id && now - previousClick.time <= 500
+          && Math.hypot(event.clientX - previousClick.x, event.clientY - previousClick.y) <= 8;
+        ui.lastNodeClick = isDoubleClick ? null : { id, time: now, x: event.clientX, y: event.clientY };
+        if (isDoubleClick) {
+          ui.drag = null;
+          if (adapter.onNodeDoubleClick && adapter.onNodeDoubleClick(node, event)) return;
+          if (!['Start', 'End'].includes(node.NodeType)) editText(node.DisplayName, event.clientX, event.clientY, value => { node.DisplayName = value; });
+          return;
         }
         const resize = event.target.closest('.node-resize-handle');
         selectNode(id, event.ctrlKey || event.metaKey || event.shiftKey);
@@ -1578,7 +1606,7 @@
     document.addEventListener('pointerup', pointerUp);
     document.addEventListener('pointercancel', pointerUp);
     viewport.addEventListener('dblclick', event => {
-      const edgeEl = event.target.closest('[data-edge-index]'), nodeEl = event.target.closest('.flow-node');
+      const edgeEl = event.target.closest('[data-edge-index]');
       if (edgeEl) {
         const index = Number(edgeEl.dataset.edgeIndex), edge = flow().Transitions[index];
         if (event.target.closest('.edge-label,.edge-label-bg')) {
@@ -1611,7 +1639,6 @@
         });
         ui.edge = index; adapter.setSelected(null); render(); adapter.selectionChanged();
       }
-      else if (nodeEl && !event.target.closest('button')) { const node = flow().Nodes.find(n => n.NodeId === nodeEl.dataset.nodeId); if (!['Start', 'End'].includes(node.NodeType)) editText(node.DisplayName, event.clientX, event.clientY, value => { node.DisplayName = value; }); }
     });
     viewport.addEventListener('wheel', event => { if (!flow()) return; event.preventDefault(); zoomTo(ui.zoom * Math.exp(-event.deltaY * .0012), event.clientX, event.clientY); }, { passive: false });
     document.addEventListener('keydown', event => {
@@ -1650,7 +1677,7 @@
       selectedEdge: () => ui.edge == null || !flow() ? null : { edge: flow().Transitions[ui.edge], index: ui.edge },
       clearEdgeSelection: () => { ui.edge = null; }, selectedIds: () => new Set(ui.selected) };
   }
-  const api = { create, nodeSize, routePoints, transitionRoutes, anchor, outcomesFor, downwardRanks, arrangeDownward };
+  const api = { create, nodeSize, routePoints, transitionRoutes, anchor, outcomesFor, downwardRanks, arrangeDownward, synchronizeEntryNode };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   host.EquipmentFlowCanvas = api;
 })();
